@@ -240,20 +240,28 @@ install_prerequisites() {
         curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
     fi
 
-    # Install Ansible
-    print_status "Installing Ansible and dependencies..."
-    sudo apt-get install -y ansible-core python3-winrm
+    # Install Ansible (only if needed)
+    if ! command -v ansible &> /dev/null; then
+        print_status "Installing Ansible and dependencies..."
+        sudo apt-get install -y ansible-core python3-winrm
+    else
+        print_status "Ansible already installed: $(ansible --version | head -1)"
+    fi
 
-    # Create virtual environment for additional Python packages
-    print_status "Setting up Python environment..."
-    python3 -m venv "$HOME/.venvs/ansible"
-    source "$HOME/.venvs/ansible/bin/activate"
-    pip install --upgrade pip
-    pip install pywinrm requests-ntlm
-    deactivate
+    # Create virtual environment for additional Python packages (only if needed)
+    if [ ! -f "$HOME/.venvs/ansible/bin/activate" ]; then
+        print_status "Setting up Python environment..."
+        python3 -m venv "$HOME/.venvs/ansible"
+        source "$HOME/.venvs/ansible/bin/activate"
+        pip install --quiet --upgrade pip
+        pip install --quiet pywinrm requests-ntlm
+        deactivate
+    else
+        print_status "Python venv already configured at $HOME/.venvs/ansible"
+    fi
 
-    # Install Ansible collections
-    print_status "Installing Ansible collections..."
+    # Install Ansible collections (idempotent by default)
+    print_status "Ensuring Ansible collections are installed..."
     ansible-galaxy collection install ansible.windows community.windows
 }
 
@@ -268,9 +276,18 @@ deploy_azure_infrastructure() {
     update_metadata "deployment_started" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     update_metadata "environment" "$ENVIRONMENT"
     
-    # Get public IP at runtime
+    # Get public IP at runtime with retry and fallback services
     print_status "Getting your public IP address..."
-    MY_PUBLIC_IP=$(curl -s https://ifconfig.me)
+    MY_PUBLIC_IP=""
+    local ip_services=("https://ifconfig.me" "https://api.ipify.org" "https://checkip.amazonaws.com")
+    local ip_attempt=0
+    while [ -z "$MY_PUBLIC_IP" ] && [ $ip_attempt -lt ${#ip_services[@]} ]; do
+        MY_PUBLIC_IP=$(curl -s --max-time 10 "${ip_services[$ip_attempt]}" 2>/dev/null | tr -d '[:space:]')
+        ip_attempt=$((ip_attempt + 1))
+    done
+    if ! echo "$MY_PUBLIC_IP" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'; then
+        print_error "Could not detect a valid public IP. Tried ${ip_services[*]}. Set MY_PUBLIC_IP in your environment to override."
+    fi
     print_status "Your public IP: $MY_PUBLIC_IP"
     update_metadata "deployer_ip" "$MY_PUBLIC_IP"
     
@@ -314,23 +331,33 @@ provider "azurerm" {
 
 # Variables
 variable "environment" {
-  default = "demo"
+  type        = string
+  description = "Environment name used in resource naming (e.g. demo, dev)"
+  default     = "demo"
 }
 
 variable "azure_region" {
-  default = "East US 2"
+  type        = string
+  description = "Azure region for all resources"
+  default     = "East US 2"
 }
 
 variable "admin_username" {
-  default = "testadmin"
+  type        = string
+  description = "Administrator username for Windows VMs"
+  default     = "testadmin"
 }
 
 variable "admin_password" {
-  default = "TestPassword123!"
+  type        = string
+  description = "Administrator password for Windows VMs. Passed via TF_VAR_admin_password or terraform.tfvars."
+  sensitive   = true
+  default     = "TestPassword123!"
 }
 
 variable "allowed_rdp_source_ip" {
-  description = "Your IP for RDP access"
+  type        = string
+  description = "CIDR of the deployer's public IP for RDP/WinRM access (e.g. 203.0.113.1/32)"
 }
 
 # Resource Group
@@ -525,6 +552,13 @@ resource "azurerm_windows_virtual_machine" "dc" {
     sku       = "2022-datacenter-azure-edition"
     version   = "latest"
   }
+
+  tags = {
+    Environment = var.environment
+    Project     = "BeyondTrust-Demo"
+    ManagedBy   = "Terraform"
+    Role        = "DomainController"
+  }
 }
 
 # SQL Server VM (replacing member server but cheaper)
@@ -553,6 +587,13 @@ resource "azurerm_windows_virtual_machine" "sql" {
     sku       = "sqldev-gen2"
     version   = "latest"
   }
+
+  tags = {
+    Environment = var.environment
+    Project     = "BeyondTrust-Demo"
+    ManagedBy   = "Terraform"
+    Role        = "SQLServer"
+  }
 }
 
 
@@ -563,7 +604,17 @@ resource "azurerm_mssql_virtual_machine" "sql" {
 
   sql_connectivity_type = "PRIVATE"
   sql_connectivity_port = 1433
-  depends_on = [azurerm_windows_virtual_machine.sql]
+  # depends_on is implicit via virtual_machine_id reference; no explicit declaration needed
+}
+
+locals {
+  winrm_script = <<-EOT
+    Enable-PSRemoting -Force
+    Set-Item -Path WSMan:\localhost\Service\Auth\Basic -Value $true
+    Set-Item -Path WSMan:\localhost\Service\AllowUnencrypted -Value $true
+    New-NetFirewallRule -DisplayName "WinRM HTTP" -Direction Inbound -LocalPort 5985 -Protocol TCP -Action Allow
+    Restart-Service WinRM
+  EOT
 }
 
 # WinRM using Run Command
@@ -573,13 +624,7 @@ resource "azurerm_virtual_machine_run_command" "dc_winrm" {
   virtual_machine_id = azurerm_windows_virtual_machine.dc.id
 
   source {
-    script = <<-EOT
-      Enable-PSRemoting -Force
-      Set-Item -Path WSMan:\localhost\Service\Auth\Basic -Value $true
-      Set-Item -Path WSMan:\localhost\Service\AllowUnencrypted -Value $true
-      New-NetFirewallRule -DisplayName "WinRM HTTP" -Direction Inbound -LocalPort 5985 -Protocol TCP -Action Allow
-      Restart-Service WinRM
-    EOT
+    script = local.winrm_script
   }
 }
 
@@ -589,13 +634,7 @@ resource "azurerm_virtual_machine_run_command" "sql_winrm" {
   virtual_machine_id = azurerm_windows_virtual_machine.sql.id
 
   source {
-    script = <<-EOT
-      Enable-PSRemoting -Force
-      Set-Item -Path WSMan:\localhost\Service\Auth\Basic -Value $true
-      Set-Item -Path WSMan:\localhost\Service\AllowUnencrypted -Value $true
-      New-NetFirewallRule -DisplayName "WinRM HTTP" -Direction Inbound -LocalPort 5985 -Protocol TCP -Action Allow
-      Restart-Service WinRM
-    EOT
+    script = local.winrm_script
   }
 }
 
@@ -622,10 +661,10 @@ output "dc_public_ip" {
 }
 
 output "deployment_info" {
+  sensitive = true
   value = {
     resource_group = azurerm_resource_group.demo.name
     dc_rdp         = "${azurerm_public_ip.dc.ip_address}:3389"
-    credentials    = "${var.admin_username} / ${var.admin_password}"
   }
 }
 EOF
@@ -651,18 +690,18 @@ EOF
 
     # Deploy infrastructure
     print_status "Deploying Azure infrastructure with Terraform..."
-    cd terraform
+    pushd "$PROJECT_DIR/terraform" > /dev/null
     terraform init
+    terraform validate
     terraform apply -auto-approve
 
     # Get DC IP
     DC_IP=$(terraform output -raw dc_public_ip)
     print_status "Domain Controller deployed at: $DC_IP"
-    
+
     # Update state with DC IP
     update_azure_info "dc_public_ip" "$DC_IP"
-    
-    cd ..
+    popd > /dev/null
 }
 
 # Phase 2: Configure Domain
@@ -1013,7 +1052,7 @@ EOF
     sleep 90
 
     # Run Ansible playbooks
-    cd ansible
+    pushd "$PROJECT_DIR/ansible" > /dev/null
     export ANSIBLE_HOST_KEY_CHECKING=False
 
     # Activate venv for ansible commands
@@ -1041,7 +1080,7 @@ EOF
     ansible-playbook playbooks/03-create-users.yml -e @group_vars/windows.yml
 
     deactivate
-    cd ..
+    popd > /dev/null
 }
 
 # Phase 3: BeyondTrust Integration
@@ -1073,69 +1112,59 @@ deploy_beyondtrust() {
     
     # Step 1: Deploy Terraform resources
     print_status "Deploying BeyondTrust Terraform resources..."
-    cd beyondtrust/terraform
+    pushd "$PROJECT_DIR/beyondtrust/terraform" > /dev/null
     terraform init
     terraform apply -auto-approve
-    
+
     # Save IDs for later use
     terraform output -raw jump_group_demo_id > demo_group_id.txt
     terraform output -raw jump_group_dc_id > dc_group_id.txt
     terraform output -raw jumpoint_id > jumpoint_id.txt
-    
+
     # Track Terraform resources in state
     add_resource "jump_group" "$(cat demo_group_id.txt)" "$JUMP_GROUP_DEMO" '{"type": "shared", "managed_by": "terraform"}'
     add_resource "jump_group" "$(cat dc_group_id.txt)" "$JUMP_GROUP_DC" '{"type": "shared", "managed_by": "terraform"}'
     add_resource "jumpoint" "$(cat jumpoint_id.txt)" "$JUMPOINT_NAME" '{"platform": "windows-x86", "managed_by": "terraform"}'
-    
-    cd ../..
-    
+    popd > /dev/null
+
     # Step 2: Create policies via API (using wrapper)
     print_status "Creating jump policies..."
-    cd beyondtrust/scripts
-    ./run-with-config.sh create-policies.sh
-    cd ../..
-    
+    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh create-policies.sh)
+
     # Step 3: Download installers (using wrapper)
     print_status "Downloading installers..."
-    cd beyondtrust/scripts
-    ./run-with-config.sh download-installers.sh || {
+    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh download-installers.sh) || {
         print_error "Failed to download installers. Check your BeyondTrust API credentials and network connectivity."
     }
-    cd ../..
-    
+
     # Step 4: Install software via Ansible
     print_status "Installing BeyondTrust software on DC01..."
-    cd ansible
-    
+    pushd "$PROJECT_DIR/ansible" > /dev/null
+
     # Activate virtual environment if needed
     if [ -f "$HOME/.venvs/ansible/bin/activate" ]; then
         source "$HOME/.venvs/ansible/bin/activate"
     fi
-    
+
     ansible-playbook "$PROJECT_DIR/beyondtrust/ansible/install-beyondtrust.yml" \
         -i inventory/hosts.yml \
         -e @group_vars/windows.yml || {
         print_warning "Ansible installation encountered issues. Continuing with API configuration..."
     }
-    
+
     if [ -n "$VIRTUAL_ENV" ]; then
         deactivate
     fi
-    
-    cd ..
-    
+    popd > /dev/null
+
     # Step 5: Configure jump items (using wrapper)
     print_status "Configuring jump items..."
-    cd beyondtrust/scripts
-    ./run-with-config.sh configure-jump-items.sh
-    cd ../..
-    
+    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-jump-items.sh)
+
     # Step 6: Configure vault (using wrapper)
     print_status "Configuring vault accounts..."
-    cd beyondtrust/scripts
-    ./run-with-config.sh configure-vault.sh
-    cd ../..
-    
+    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-vault.sh)
+
     # Update deployment completed timestamp
     update_metadata "deployment_completed" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
@@ -1244,13 +1273,37 @@ create_beyondtrust_api_helper() {
 #!/bin/bash
 # BeyondTrust API helper functions
 
-# Get OAuth token
+# Token cache (in-memory, valid for the lifetime of the calling process)
+_BT_TOKEN=""
+_BT_TOKEN_EXPIRY=0
+
+# Get OAuth token with in-memory caching to avoid a new credential request per API call
 get_api_token() {
-    local response=$(curl -s -X POST "$BT_API_HOST/oauth2/token" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "grant_type=client_credentials&client_id=$BT_CLIENT_ID&client_secret=$BT_CLIENT_SECRET")
-    
-    echo "$response" | jq -r .access_token
+    local now
+    now=$(date +%s)
+    # Refresh if no token or within 60 seconds of expiry
+    if [ -z "$_BT_TOKEN" ] || [ "$now" -ge "$((_BT_TOKEN_EXPIRY - 60))" ]; then
+        local response attempt=0
+        while [ $attempt -lt 3 ]; do
+            response=$(curl -s --max-time 15 -X POST "$BT_API_HOST/oauth2/token" \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                -d "grant_type=client_credentials&client_id=$BT_CLIENT_ID&client_secret=$BT_CLIENT_SECRET")
+            _BT_TOKEN=$(echo "$response" | jq -r .access_token)
+            if [ -n "$_BT_TOKEN" ] && [ "$_BT_TOKEN" != "null" ]; then
+                local expires_in
+                expires_in=$(echo "$response" | jq -r '.expires_in // 600')
+                _BT_TOKEN_EXPIRY=$((now + expires_in))
+                break
+            fi
+            attempt=$((attempt + 1))
+            [ $attempt -lt 3 ] && sleep $((attempt * 2))
+        done
+        if [ -z "$_BT_TOKEN" ] || [ "$_BT_TOKEN" = "null" ]; then
+            echo "ERROR: Failed to obtain API token after 3 attempts. Check BT_API_HOST, BT_CLIENT_ID, and BT_CLIENT_SECRET." >&2
+            return 1
+        fi
+    fi
+    echo "$_BT_TOKEN"
 }
 
 # Make API call
@@ -1258,22 +1311,18 @@ api_call() {
     local method="$1"
     local endpoint="$2"
     local data="$3"
-    
-    local token=$(get_api_token)
-    
-    if [ -z "$token" ] || [ "$token" = "null" ]; then
-        echo "Failed to get API token" >&2
-        return 1
-    fi
-    
+
+    local token
+    token=$(get_api_token) || return 1
+
     local args=(-s -X "$method" "$BT_API_HOST/api/config/v1$endpoint" \
         -H "Authorization: Bearer $token" \
         -H "Accept: application/json")
-    
+
     if [ -n "$data" ]; then
         args+=(-H "Content-Type: application/json" -d "$data")
     fi
-    
+
     curl "${args[@]}"
 }
 EOF
@@ -1287,11 +1336,14 @@ create_beyondtrust_state_helper() {
     cat > beyondtrust/scripts/state-helper.sh << 'EOF'
 #!/bin/bash
 # State file helper for BeyondTrust resources
+# NOTE: add_bt_resource and get_bt_resources mirror the add_resource/get_resources
+# functions defined in deploy-updated.sh. Keep them in sync if the logic changes.
 
-# Get the main state file path
-STATE_FILE="../../deployment-state.json"
+# Derive an absolute path to the state file regardless of working directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_FILE="$SCRIPT_DIR/../../deployment-state.json"
 
-# Wrapper functions that use the main state file (FIXED)
+# Wrapper functions that use the main state file
 add_bt_resource() {
     local resource_type="$1"
     local resource_id="$2"
@@ -2173,40 +2225,37 @@ cleanup_all() {
     fi
     
     # Step 1: Clean up BeyondTrust API resources first
-    if [ -d "beyondtrust/scripts" ] && [ -f "beyondtrust/scripts/cleanup-resources.sh" ]; then
+    if [ -d "$PROJECT_DIR/beyondtrust/scripts" ] && [ -f "$PROJECT_DIR/beyondtrust/scripts/cleanup-resources.sh" ]; then
         print_status "Cleaning up BeyondTrust API resources..."
-        cd beyondtrust/scripts
-        if [ -f "run-with-config.sh" ]; then
-            ./run-with-config.sh cleanup-resources.sh
+        if [ -f "$PROJECT_DIR/beyondtrust/scripts/run-with-config.sh" ]; then
+            (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh cleanup-resources.sh)
         else
             # Fallback: run directly with environment variables
-            source ../../config.env
-            export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET RESOURCE_PREFIX
-            ./cleanup-resources.sh
+            (cd "$PROJECT_DIR/beyondtrust/scripts" && \
+                source "$CONFIG_FILE" && \
+                export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET RESOURCE_PREFIX && \
+                ./cleanup-resources.sh)
         fi
-        cd ../..
     fi
-    
+
     # Step 2: Destroy BeyondTrust Terraform resources
-    if [ -d "beyondtrust/terraform" ] && [ -f "beyondtrust/terraform/terraform.tfstate" ]; then
+    if [ -d "$PROJECT_DIR/beyondtrust/terraform" ] && [ -f "$PROJECT_DIR/beyondtrust/terraform/terraform.tfstate" ]; then
         print_status "Destroying BeyondTrust Terraform resources..."
-        cd beyondtrust/terraform
-        terraform destroy -auto-approve
-        cd ../..
+        (cd "$PROJECT_DIR/beyondtrust/terraform" && terraform destroy -auto-approve)
     fi
-    
+
     # Step 3: Destroy Azure infrastructure
-    if [ -d "terraform" ] && [ -f "terraform/terraform.tfstate" ]; then
+    if [ -d "$PROJECT_DIR/terraform" ] && [ -f "$PROJECT_DIR/terraform/terraform.tfstate" ]; then
         print_status "Destroying Azure infrastructure..."
-        
+
         # Login to Azure if needed
         if ! az account show &> /dev/null; then
             print_status "Logging into Azure for cleanup..."
             az login
         fi
-        
+
         # Get subscription from state or prompt
-        cd terraform
+        pushd "$PROJECT_DIR/terraform" > /dev/null
         if terraform show &> /dev/null; then
             AZURE_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
             export ARM_SUBSCRIPTION_ID="$AZURE_SUBSCRIPTION_ID"
@@ -2214,7 +2263,7 @@ cleanup_all() {
         else
             print_warning "Unable to read Terraform state. Manual cleanup may be required."
         fi
-        cd ..
+        popd > /dev/null
     fi
     
     # Step 4: Clean up files
@@ -2231,19 +2280,26 @@ cleanup_all() {
         ARCHIVE_NAME="${STATE_FILE}.$(date +%Y%m%d-%H%M%S).bak"
         print_status "Archiving state file to: $ARCHIVE_NAME"
         mv "$STATE_FILE" "$ARCHIVE_NAME"
+        ARCHIVED_PATH="$ARCHIVE_NAME"
     fi
-    
+
     print_status "Cleanup completed!"
     echo ""
     echo "Note: Configuration file preserved at: $CONFIG_FILE"
     echo "Note: BeyondTrust software may still be installed on DC01."
-    if [ -f "$ARCHIVE_NAME" ]; then
-        echo "Note: State file archived at: $ARCHIVE_NAME"
+    if [ -n "${ARCHIVED_PATH:-}" ]; then
+        echo "Note: State file archived at: $ARCHIVED_PATH"
     fi
 }
 
 # Main function
 main() {
+    # Ensure log directory exists then redirect all output to a timestamped log file
+    mkdir -p "$PROJECT_DIR" 2>/dev/null || true
+    LOG_FILE="$PROJECT_DIR/deploy-$(date +%Y%m%d-%H%M%S).log"
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    echo "Logging to: $LOG_FILE"
+
     if [ "$CLEANUP_MODE" = true ]; then
         echo "=================================================="
         echo "BeyondTrust Demo Environment - Cleanup Mode"
@@ -2251,11 +2307,11 @@ main() {
         cleanup_all
         exit 0
     fi
-    
+
     echo "=================================================="
     echo "BeyondTrust Demo Environment - Complete Deployment"
     echo "=================================================="
-    
+
     # Setup directories and create config if needed
     setup_directories
     create_config_template
