@@ -2244,10 +2244,20 @@ install_chocolatey() {
     if [ "$choco_check" = "installed" ]; then
         print_status "Chocolatey already installed, skipping..."
     else
-        print_status "Installing Chocolatey..."
-        ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-            -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString("https://chocolatey.org/install.ps1")) }' \
-            -e @group_vars/windows.yml
+        print_status "Installing Chocolatey via Azure VM Run Command (bypasses WinRM restrictions)..."
+        local choco_result
+        choco_result=$(az vm run-command invoke \
+            --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+            --name "vm-sql-$ENVIRONMENT" \
+            --command-id RunPowerShellScript \
+            --scripts 'Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString("https://chocolatey.org/install.ps1")); if (Test-Path "C:\ProgramData\chocolatey\bin\choco.exe") { Write-Output "CHOCO_OK" } else { Write-Output "CHOCO_FAIL"; exit 1 }' \
+            --output json 2>&1)
+        if echo "$choco_result" | grep -q "CHOCO_OK"; then
+            print_status "Chocolatey installed successfully"
+        else
+            print_error "Chocolatey installation failed: $choco_result"
+            exit 1
+        fi
     fi
 
     cd "$PROJECT_DIR"
@@ -2269,16 +2279,37 @@ install_ssms() {
         print_status "SSMS already installed at: $SSMS_PATH"
         print_status "Skipping SSMS installation via Chocolatey"
     else
-        print_status "Installing SSMS via Chocolatey (this will take 5-10 minutes)..."
-        ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-            -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { C:\ProgramData\chocolatey\bin\choco.exe install sql-server-management-studio -y --no-progress }' \
-            -e @group_vars/windows.yml -B 1200 -P 30
+        print_status "Installing SSMS via Azure VM Run Command (this will take 5-10 minutes)..."
+        local ssms_install_result
+        ssms_install_result=$(az vm run-command invoke \
+            --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+            --name "vm-sql-$ENVIRONMENT" \
+            --command-id RunPowerShellScript \
+            --scripts 'C:\ProgramData\chocolatey\bin\choco.exe install sql-server-management-studio -y --no-progress; if ($LASTEXITCODE -eq 0) { Write-Output "SSMS_INSTALL_OK" } else { Write-Output "SSMS_INSTALL_FAIL"; exit 1 }' \
+            --output json 2>&1)
+        if echo "$ssms_install_result" | grep -q "SSMS_INSTALL_OK"; then
+            print_status "SSMS installed successfully"
+        else
+            print_error "SSMS installation failed: $ssms_install_result"
+            exit 1
+        fi
     fi
 
     print_status "Verifying SSMS installation path..."
-    ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Get-ChildItem "C:\Program Files (x86)\Microsoft SQL Server Management Studio*\Common7\IDE\Ssms.exe", "C:\Program Files\Microsoft SQL Server Management Studio*\Common7\IDE\Ssms.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName }' \
-        -e @group_vars/windows.yml
+    local ssms_path_result
+    ssms_path_result=$(az vm run-command invoke \
+        --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+        --name "vm-sql-$ENVIRONMENT" \
+        --command-id RunPowerShellScript \
+        --scripts '$p = Get-ChildItem "C:\Program Files (x86)\Microsoft SQL Server Management Studio*\Common7\IDE\Ssms.exe","C:\Program Files\Microsoft SQL Server Management Studio*\Common7\IDE\Ssms.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName; if ($p) { Write-Output "SSMS_PATH:$p" } else { Write-Output "SSMS_NOT_FOUND" }' \
+        --output json 2>&1)
+    local ssms_path_line
+    ssms_path_line=$(echo "$ssms_path_result" | jq -r '.value[0].message // ""' | grep "SSMS_PATH:" | head -1 | sed 's/.*SSMS_PATH://' | tr -d '\r\n' | xargs)
+    if [ -n "$ssms_path_line" ]; then
+        print_status "SSMS verified at: $ssms_path_line"
+    else
+        print_warning "Could not verify SSMS path — installation may still be valid"
+    fi
 
     cd "$PROJECT_DIR"
 }
@@ -2297,18 +2328,28 @@ install_rds_roles() {
     if [ "$rds_check" = "installed" ]; then
         print_status "RDS roles already installed, skipping..."
     else
-        print_status "Installing RDS roles..."
-        RDS_INSTALL_OUTPUT=$(ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-            -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Install-WindowsFeature -Name RDS-RD-Server, RDS-Connection-Broker, RDS-Web-Access -IncludeManagementTools -Restart:$false }' \
-            -e @group_vars/windows.yml -B 600 -P 30 2>&1)
+        print_status "Installing RDS roles via Azure VM Run Command..."
+        RDS_INSTALL_OUTPUT=$(az vm run-command invoke \
+            --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+            --name "vm-sql-$ENVIRONMENT" \
+            --command-id RunPowerShellScript \
+            --scripts '$r = Install-WindowsFeature -Name RDS-RD-Server,RDS-Connection-Broker,RDS-Web-Access -IncludeManagementTools -Restart:$false; Write-Output "Success=$($r.Success) RestartNeeded=$($r.RestartNeeded) ExitCode=$($r.ExitCode)"' \
+            --output json 2>&1)
 
         echo "$RDS_INSTALL_OUTPUT"
 
-        if echo "$RDS_INSTALL_OUTPUT" | grep -q "RestartNeeded  : Yes" || echo "$RDS_INSTALL_OUTPUT" | grep -q "SuccessRestartRequired"; then
+        local rds_msg
+        rds_msg=$(echo "$RDS_INSTALL_OUTPUT" | jq -r '.value[0].message // ""')
+        echo "$rds_msg"
+
+        if echo "$rds_msg" | grep -q "RestartNeeded=Yes" || echo "$rds_msg" | grep -q "RestartNeeded=True"; then
             print_status "Reboot required after RDS installation. Rebooting SQL server..."
-            ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-                -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Restart-Computer -Force }' \
-                -e @group_vars/windows.yml
+            az vm run-command invoke \
+                --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+                --name "vm-sql-$ENVIRONMENT" \
+                --command-id RunPowerShellScript \
+                --scripts 'Restart-Computer -Force' \
+                --output json 2>&1 || true
 
             print_status "Waiting for SQL server to reboot (30 seconds initial pause)..."
             sleep 30
@@ -2343,120 +2384,89 @@ install_rds_roles() {
     cd "$PROJECT_DIR"
 }
 
-# Phase 4 — Step 0: Configure CredSSP so subsequent steps can delegate credentials.
-# Must run before any Invoke-Command that spawns child processes on SQL01 (Chocolatey,
-# SSMS install, Install-WindowsFeature). Without this the double-hop from DC01 to
-# SQL01 runs as NETWORK SERVICE, which cannot call CreateProcessW (Win32Error 5).
-configure_credssp() {
-    print_status "Configuring CredSSP for double-hop credential delegation..."
-
-    cd "$PROJECT_DIR/ansible"
-
-    print_status "Installing RSAT-RDS-Tools on DC (required for New-RDSessionDeployment)..."
-    ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a 'Install-WindowsFeature RSAT-RDS-Tools -IncludeManagementTools' \
-        -e @group_vars/windows.yml
-
-    print_status "Enabling CredSSP server role on SQL01..."
-    ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -ScriptBlock { Enable-PSRemoting -Force -SkipNetworkProfileCheck; Set-Item WSMan:\localhost\Client\TrustedHosts -Value "DC01,DC01.{{ domain_name }},*.{{ domain_name }}" -Force; Enable-WSManCredSSP -Role Server -Force }' \
-        -e @group_vars/windows.yml
-
-    print_status "Enabling CredSSP client role on DC (delegating to SQL01)..."
-    ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a 'Enable-WSManCredSSP -Role Client -DelegateComputer "SQL01.{{ domain_name }}","*.{{ domain_name }}" -Force' \
-        -e @group_vars/windows.yml
-
-    print_status "Configuring credential delegation policy on DC..."
-    ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$null = New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation" -Force; $null = New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation\AllowFreshCredentials" -Force; $null = New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation\AllowFreshCredentialsWhenNTLMOnly" -Force; Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation" -Name "AllowFreshCredentials" -Value 1 -Type DWord; Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation" -Name "ConcatenateDefaults_AllowFresh" -Value 1 -Type DWord; Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation" -Name "AllowFreshCredentialsWhenNTLMOnly" -Value 1 -Type DWord; Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation" -Name "ConcatenateDefaults_AllowFreshNTLMOnly" -Value 1 -Type DWord; Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation\AllowFreshCredentials" -Name "1" -Value "WSMAN/*.{{ domain_name }}" -Type String; Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation\AllowFreshCredentialsWhenNTLMOnly" -Name "1" -Value "WSMAN/*.{{ domain_name }}" -Type String; gpupdate /force' \
-        -e @group_vars/windows.yml
-
-    cd "$PROJECT_DIR"
-}
-
 # Phase 4 — Step 4: Configure the RDS deployment on SQL01 (deployment + Web Access)
-# CredSSP is already configured by configure_credssp() in Step 4.0
 configure_rds_deployment() {
     print_status "Configuring RDS deployment..."
 
-    cd "$PROJECT_DIR/ansible"
+    # RDS cmdlets (New-RDSessionDeployment, Add-RDServer) need to run locally on SQL01
+    # as it is the connection broker. They also require domain-admin rights to create AD
+    # service connection points. We use az vm run-command (runs as SYSTEM, which has
+    # SeTcbPrivilege) to create a scheduled task under explicit domain-admin credentials.
 
-    print_status "Checking RDS deployment status..."
-    ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Import-Module RemoteDesktop; Write-Host "=== Checking RDS State ==="; try { $servers = Get-RDServer -ErrorAction SilentlyContinue; if ($servers) { Write-Host "RDS Servers found:"; $servers | Format-Table -AutoSize } else { Write-Host "No RDS deployment found" } } catch { Write-Host "Error checking RDS: $_" }; Write-Host "`n=== RDS Services ==="; Get-Service -Name "*RDS*","*RemoteDesktop*" | Where-Object { $_.Status -eq "Running" } | Format-Table -AutoSize }' \
-        -e @group_vars/windows.yml
+    print_status "Checking current RDS state on SQL01..."
+    local rds_state_result
+    rds_state_result=$(az vm run-command invoke \
+        --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+        --name "vm-sql-$ENVIRONMENT" \
+        --command-id RunPowerShellScript \
+        --scripts 'Import-Module RemoteDesktop -ErrorAction SilentlyContinue; try { $s = Get-RDServer -ErrorAction SilentlyContinue; if ($s) { Write-Output "RDS_DEPLOYED" } else { Write-Output "RDS_NOT_DEPLOYED" } } catch { Write-Output "RDS_NOT_DEPLOYED" }; Get-Service -Name "*RDS*","*RemoteDesktop*" | Where-Object { $_.Status -eq "Running" } | ForEach-Object { Write-Output "Running: $($_.Name)" }' \
+        --output json 2>&1)
+    echo "$rds_state_result" | jq -r '.value[0].message // ""'
 
-    print_status "Creating RDS deployment..."
-    RDS_DEPLOY_RESULT=$(ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a 'Import-Module RemoteDesktop; $password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Import-Module RemoteDesktop; try { New-RDSessionDeployment -ConnectionBroker "SQL01.{{ domain_name }}" -SessionHost "SQL01.{{ domain_name }}" -ErrorAction Stop; Write-Host "RDS deployment created successfully" } catch { if ($_.Exception.Message -like "*already exists*" -or $_.Exception.Message -like "*deployment is already*") { Write-Host "RDS deployment already exists" } else { throw $_ } } }' \
-        -e @group_vars/windows.yml 2>&1)
+    print_status "Creating RDS deployment via scheduled task (domain admin context)..."
+    local rds_deploy_result
+    rds_deploy_result=$(az vm run-command invoke \
+        --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+        --name "vm-sql-$ENVIRONMENT" \
+        --command-id RunPowerShellScript \
+        --scripts "\$adminUser = '$DOMAIN_NETBIOS_NAME\\$ADMIN_USERNAME'; \$adminPass = '$ADMIN_PASSWORD'; \$outFile = 'C:\\Windows\\Temp\\rds-deploy-out.txt'; \$script = 'Import-Module RemoteDesktop; try { New-RDSessionDeployment -ConnectionBroker SQL01.$DOMAIN_NAME -SessionHost SQL01.$DOMAIN_NAME -ErrorAction Stop; \"RDS_CREATED\" | Out-File -FilePath $outFile } catch { if (\$_.Exception.Message -like \"*already*\") { \"RDS_EXISTS\" | Out-File -FilePath $outFile } else { \$_.Exception.Message | Out-File -FilePath $outFile; exit 1 } }'; \$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument \"-NoProfile -ExecutionPolicy Bypass -Command \$script\"; \$principal = New-ScheduledTaskPrincipal -UserId \$adminUser -LogonType Password -RunLevel Highest; Register-ScheduledTask -TaskName 'RDSDeploy' -Action \$action -Principal \$principal -Force | Out-Null; \$taskPwd = ConvertTo-SecureString \$adminPass -AsPlainText -Force; Set-ScheduledTask -TaskName 'RDSDeploy' -User \$adminUser -Password \$adminPass | Out-Null; Start-ScheduledTask -TaskName 'RDSDeploy'; \$i=0; while ((Get-ScheduledTask -TaskName 'RDSDeploy').State -ne 'Ready' -and \$i -lt 30) { Start-Sleep 10; \$i++ }; Unregister-ScheduledTask -TaskName 'RDSDeploy' -Confirm:\$false; if (Test-Path \$outFile) { Get-Content \$outFile } else { 'RDS_NO_OUTPUT' }" \
+        --output json 2>&1)
 
-    echo "$RDS_DEPLOY_RESULT"
+    local rds_deploy_msg
+    rds_deploy_msg=$(echo "$rds_deploy_result" | jq -r '.value[0].message // ""')
+    echo "$rds_deploy_msg"
 
-    if echo "$RDS_DEPLOY_RESULT" | grep -q "created successfully\|already exists"; then
+    if echo "$rds_deploy_msg" | grep -q "RDS_CREATED\|RDS_EXISTS"; then
         print_status "RDS deployment is ready"
 
         print_status "Adding Web Access role..."
-        ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-            -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Import-Module RemoteDesktop; try { Add-RDServer -Server "SQL01.{{ domain_name }}" -Role "RDS-WEB-ACCESS" -ConnectionBroker "SQL01.{{ domain_name }}" -ErrorAction Stop; Write-Host "Web Access role added successfully" } catch { if ($_.Exception.Message -like "*already*") { Write-Host "Web Access role already configured" } else { throw $_ } } }' \
-            -e @group_vars/windows.yml
+        az vm run-command invoke \
+            --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+            --name "vm-sql-$ENVIRONMENT" \
+            --command-id RunPowerShellScript \
+            --scripts "\$adminUser = '$DOMAIN_NETBIOS_NAME\\$ADMIN_USERNAME'; \$adminPass = '$ADMIN_PASSWORD'; \$outFile = 'C:\\Windows\\Temp\\rds-webaccess-out.txt'; \$script = 'Import-Module RemoteDesktop; try { Add-RDServer -Server SQL01.$DOMAIN_NAME -Role RDS-WEB-ACCESS -ConnectionBroker SQL01.$DOMAIN_NAME -ErrorAction Stop; \"WEB_ACCESS_ADDED\" | Out-File -FilePath $outFile } catch { if (\$_.Exception.Message -like \"*already*\") { \"WEB_ACCESS_EXISTS\" | Out-File -FilePath $outFile } else { \$_.Exception.Message | Out-File -FilePath $outFile } }'; \$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument \"-NoProfile -ExecutionPolicy Bypass -Command \$script\"; \$principal = New-ScheduledTaskPrincipal -UserId \$adminUser -LogonType Password -RunLevel Highest; Register-ScheduledTask -TaskName 'RDSWebAccess' -Action \$action -Principal \$principal -Force | Out-Null; Set-ScheduledTask -TaskName 'RDSWebAccess' -User \$adminUser -Password \$adminPass | Out-Null; Start-ScheduledTask -TaskName 'RDSWebAccess'; \$i=0; while ((Get-ScheduledTask -TaskName 'RDSWebAccess').State -ne 'Ready' -and \$i -lt 30) { Start-Sleep 10; \$i++ }; Unregister-ScheduledTask -TaskName 'RDSWebAccess' -Confirm:\$false; if (Test-Path \$outFile) { Get-Content \$outFile } else { 'WEB_NO_OUTPUT' }" \
+            --output json 2>&1 | jq -r '.value[0].message // ""'
     else
-        print_error "Failed to create RDS deployment. You may need to run cleanup and try again."
+        print_error "Failed to create RDS deployment. Output: $rds_deploy_msg"
         exit 1
     fi
-
-    cd "$PROJECT_DIR"
 }
 
 # Phase 4 — Step 5: Create RemoteApp collection and publish SSMS
 publish_ssms_remoteapp() {
     print_status "Publishing SSMS as RemoteApp..."
 
-    cd "$PROJECT_DIR/ansible"
+    # All RemoteApp cmdlets run locally on SQL01 (it is the connection broker).
+    # We use az vm run-command + scheduled task for domain-admin context,
+    # same pattern as configure_rds_deployment().
 
-    print_status "Checking existing session collections..."
-    ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Import-Module RemoteDesktop; try { $collections = Get-RDSessionCollection -ConnectionBroker "SQL01.{{ domain_name }}" -ErrorAction SilentlyContinue; if ($collections) { Write-Host "Found collections:"; $collections | Format-Table -AutoSize } else { Write-Host "No collections found" } } catch { Write-Host "Error checking collections: $_" } }' \
-        -e @group_vars/windows.yml
+    print_status "Creating RemoteApp session collection and publishing SSMS..."
+    local remoteapp_result
+    remoteapp_result=$(az vm run-command invoke \
+        --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+        --name "vm-sql-$ENVIRONMENT" \
+        --command-id RunPowerShellScript \
+        --scripts "\$adminUser = '$DOMAIN_NETBIOS_NAME\\$ADMIN_USERNAME'; \$adminPass = '$ADMIN_PASSWORD'; \$outFile = 'C:\\Windows\\Temp\\remoteapp-out.txt'; \$script = 'Import-Module RemoteDesktop; \$broker = \"SQL01.$DOMAIN_NAME\"; try { \$existing = Get-RDSessionCollection -CollectionName RemoteApps -ConnectionBroker \$broker -ErrorAction SilentlyContinue; if (-not \$existing) { New-RDSessionCollection -CollectionName RemoteApps -SessionHost \$broker -ConnectionBroker \$broker -CollectionDescription \"Remote Applications Collection\" -ErrorAction Stop }; \$ssmsPath = Get-ChildItem -Path \"C:\\Program Files (x86)\\Microsoft SQL Server Management Studio*\",\"C:\\Program Files\\Microsoft SQL Server Management Studio*\" -Filter Ssms.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName; if (-not \$ssmsPath) { \"SSMS_NOT_FOUND\" | Out-File \$outFile; exit 1 }; try { Remove-RDRemoteApp -CollectionName RemoteApps -Alias SSMS -ConnectionBroker \$broker -Force -ErrorAction SilentlyContinue } catch {}; New-RDRemoteApp -CollectionName RemoteApps -DisplayName \"SQL Server Management Studio\" -FilePath \$ssmsPath -Alias SSMS -ShowInWebAccess \$true -ConnectionBroker \$broker -IconPath C:\\Windows\\System32\\shell32.dll -IconIndex 0; \"REMOTEAPP_OK\" | Out-File \$outFile } catch { \$_.Exception.Message | Out-File \$outFile; exit 1 }'; \$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument \"-NoProfile -ExecutionPolicy Bypass -Command \$script\"; \$principal = New-ScheduledTaskPrincipal -UserId \$adminUser -LogonType Password -RunLevel Highest; Register-ScheduledTask -TaskName 'RDSRemoteApp' -Action \$action -Principal \$principal -Force | Out-Null; Set-ScheduledTask -TaskName 'RDSRemoteApp' -User \$adminUser -Password \$adminPass | Out-Null; Start-ScheduledTask -TaskName 'RDSRemoteApp'; \$i=0; while ((Get-ScheduledTask -TaskName 'RDSRemoteApp').State -ne 'Ready' -and \$i -lt 30) { Start-Sleep 10; \$i++ }; Unregister-ScheduledTask -TaskName 'RDSRemoteApp' -Confirm:\$false; if (Test-Path \$outFile) { Get-Content \$outFile } else { 'NO_OUTPUT' }" \
+        --output json 2>&1)
 
-    COLLECTION_RESULT=$(ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Import-Module RemoteDesktop; try { $existing = Get-RDSessionCollection -CollectionName "RemoteApps" -ConnectionBroker "SQL01.{{ domain_name }}" -ErrorAction SilentlyContinue; if ($existing) { Write-Host "COLLECTION_EXISTS"; return } } catch { }; try { New-RDSessionCollection -CollectionName "RemoteApps" -SessionHost "SQL01.{{ domain_name }}" -ConnectionBroker "SQL01.{{ domain_name }}" -CollectionDescription "Remote Applications Collection" -ErrorAction Stop; Write-Host "COLLECTION_CREATED" } catch { Write-Host "COLLECTION_ERROR: $_"; throw } }' \
-        -e @group_vars/windows.yml 2>&1)
+    local remoteapp_msg
+    remoteapp_msg=$(echo "$remoteapp_result" | jq -r '.value[0].message // ""')
+    echo "$remoteapp_msg"
 
-    echo "$COLLECTION_RESULT"
-
-    if echo "$COLLECTION_RESULT" | grep -q "COLLECTION_EXISTS\|COLLECTION_CREATED"; then
-        print_status "RemoteApp collection is ready"
+    if echo "$remoteapp_msg" | grep -q "REMOTEAPP_OK"; then
+        print_status "SSMS RemoteApp published successfully"
     else
-        print_error "Failed to create session collection"
+        print_error "Failed to publish SSMS RemoteApp. Output: $remoteapp_msg"
         exit 1
     fi
-
-    print_status "Locating SSMS installation..."
-    SSMS_PATH_RESULT=$(ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { $ssmsPath = Get-ChildItem -Path "C:\Program Files (x86)\Microsoft SQL Server Management Studio*", "C:\Program Files\Microsoft SQL Server Management Studio*" -Filter "Ssms.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName; if ($ssmsPath) { Write-Output "SSMS_PATH:$ssmsPath" } else { Write-Output "SSMS_NOT_FOUND" } }' \
-        -e @group_vars/windows.yml 2>&1)
-
-    if echo "$SSMS_PATH_RESULT" | grep -q "SSMS_NOT_FOUND"; then
-        print_error "SSMS executable not found. Please ensure SSMS is installed."
-        exit 1
-    fi
-
-    SSMS_PATH=$(echo "$SSMS_PATH_RESULT" | grep "SSMS_PATH:" | sed 's/SSMS_PATH://g' | tr -d '\r\n' | sed 's/\\r//g' | sed 's/\\n//g' | xargs)
-    print_status "Found SSMS at: $SSMS_PATH"
-
-    print_status "Publishing SSMS as RemoteApp..."
-    ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Import-Module RemoteDesktop; $ssmsPath = Get-ChildItem -Path "C:\Program Files (x86)\Microsoft SQL Server Management Studio*", "C:\Program Files\Microsoft SQL Server Management Studio*" -Filter "Ssms.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName; if (-not $ssmsPath) { throw "SSMS not found" }; try { Remove-RDRemoteApp -CollectionName "RemoteApps" -Alias "SSMS" -ConnectionBroker "SQL01.{{ domain_name }}" -Force -ErrorAction SilentlyContinue } catch { }; New-RDRemoteApp -CollectionName "RemoteApps" -DisplayName "SQL Server Management Studio" -FilePath $ssmsPath -Alias "SSMS" -ShowInWebAccess $true -ConnectionBroker "SQL01.{{ domain_name }}" -IconPath "C:\Windows\System32\shell32.dll" -IconIndex 0 }' \
-        -e @group_vars/windows.yml
 
     print_status "Verifying RDS deployment..."
-    ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Import-Module RemoteDesktop; Write-Host "=== RDS Servers ==="; Get-RDServer -ConnectionBroker "SQL01.{{ domain_name }}"; Write-Host "`n=== Session Collections ==="; Get-RDSessionCollection -ConnectionBroker "SQL01.{{ domain_name }}"; Write-Host "`n=== Published RemoteApps ==="; Get-RDRemoteApp -ConnectionBroker "SQL01.{{ domain_name }}" | Select-Object DisplayName, Alias }' \
-        -e @group_vars/windows.yml
-
-    cd "$PROJECT_DIR"
+    az vm run-command invoke \
+        --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+        --name "vm-sql-$ENVIRONMENT" \
+        --command-id RunPowerShellScript \
+        --scripts 'Import-Module RemoteDesktop; Write-Output "=== RDS Servers ==="; Get-RDServer -ConnectionBroker "SQL01" -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String; Write-Output "=== Session Collections ==="; Get-RDSessionCollection -ConnectionBroker "SQL01" -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String; Write-Output "=== Published RemoteApps ==="; Get-RDRemoteApp -ConnectionBroker "SQL01" -ErrorAction SilentlyContinue | Select-Object DisplayName,Alias | Format-Table -AutoSize | Out-String' \
+        --output json 2>&1 | jq -r '.value[0].message // ""'
 }
 
 # Phase 4 — Step 6: Register SSMS RemoteApp jump item in BeyondTrust
@@ -2578,10 +2588,6 @@ deploy_rds() {
     echo "=================================================="
     echo "Phase 4: RDS Deployment"
     echo "=================================================="
-
-    print_status "Step 4.0: Configuring CredSSP credential delegation"
-    configure_credssp
-    echo ""
 
     print_status "Step 4.1: Installing Chocolatey"
     install_chocolatey
