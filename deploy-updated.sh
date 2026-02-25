@@ -2246,7 +2246,7 @@ install_chocolatey() {
     else
         print_status "Installing Chocolatey..."
         ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-            -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -ScriptBlock { Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString("https://chocolatey.org/install.ps1")) }' \
+            -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString("https://chocolatey.org/install.ps1")) }' \
             -e @group_vars/windows.yml
     fi
 
@@ -2271,13 +2271,13 @@ install_ssms() {
     else
         print_status "Installing SSMS via Chocolatey (this will take 5-10 minutes)..."
         ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-            -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -ScriptBlock { C:\ProgramData\chocolatey\bin\choco.exe install sql-server-management-studio -y --no-progress }' \
+            -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { C:\ProgramData\chocolatey\bin\choco.exe install sql-server-management-studio -y --no-progress }' \
             -e @group_vars/windows.yml -B 1200 -P 30
     fi
 
     print_status "Verifying SSMS installation path..."
     ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -ScriptBlock { Get-ChildItem "C:\Program Files (x86)\Microsoft SQL Server Management Studio*\Common7\IDE\Ssms.exe", "C:\Program Files\Microsoft SQL Server Management Studio*\Common7\IDE\Ssms.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName }' \
+        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Get-ChildItem "C:\Program Files (x86)\Microsoft SQL Server Management Studio*\Common7\IDE\Ssms.exe", "C:\Program Files\Microsoft SQL Server Management Studio*\Common7\IDE\Ssms.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName }' \
         -e @group_vars/windows.yml
 
     cd "$PROJECT_DIR"
@@ -2299,7 +2299,7 @@ install_rds_roles() {
     else
         print_status "Installing RDS roles..."
         RDS_INSTALL_OUTPUT=$(ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-            -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -ScriptBlock { Install-WindowsFeature -Name RDS-RD-Server, RDS-Connection-Broker, RDS-Web-Access -IncludeManagementTools -Restart:$false }' \
+            -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Install-WindowsFeature -Name RDS-RD-Server, RDS-Connection-Broker, RDS-Web-Access -IncludeManagementTools -Restart:$false }' \
             -e @group_vars/windows.yml -B 600 -P 30 2>&1)
 
         echo "$RDS_INSTALL_OUTPUT"
@@ -2307,7 +2307,7 @@ install_rds_roles() {
         if echo "$RDS_INSTALL_OUTPUT" | grep -q "RestartNeeded  : Yes" || echo "$RDS_INSTALL_OUTPUT" | grep -q "SuccessRestartRequired"; then
             print_status "Reboot required after RDS installation. Rebooting SQL server..."
             ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-                -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -ScriptBlock { Restart-Computer -Force }' \
+                -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Restart-Computer -Force }' \
                 -e @group_vars/windows.yml
 
             print_status "Waiting for SQL server to reboot (30 seconds initial pause)..."
@@ -2343,31 +2343,44 @@ install_rds_roles() {
     cd "$PROJECT_DIR"
 }
 
-# Phase 4 — Step 4: Configure the RDS deployment on SQL01 (CredSSP + deployment + Web Access)
-configure_rds_deployment() {
-    print_status "Configuring RDS deployment..."
+# Phase 4 — Step 0: Configure CredSSP so subsequent steps can delegate credentials.
+# Must run before any Invoke-Command that spawns child processes on SQL01 (Chocolatey,
+# SSMS install, Install-WindowsFeature). Without this the double-hop from DC01 to
+# SQL01 runs as NETWORK SERVICE, which cannot call CreateProcessW (Win32Error 5).
+configure_credssp() {
+    print_status "Configuring CredSSP for double-hop credential delegation..."
 
     cd "$PROJECT_DIR/ansible"
 
-    print_status "Installing RDS management tools on DC..."
+    print_status "Installing RSAT-RDS-Tools on DC (required for New-RDSessionDeployment)..."
     ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
         -a 'Install-WindowsFeature RSAT-RDS-Tools -IncludeManagementTools' \
         -e @group_vars/windows.yml
 
-    print_status "Configuring CredSSP on SQL server..."
+    print_status "Enabling CredSSP server role on SQL01..."
     ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
         -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -ScriptBlock { Enable-PSRemoting -Force -SkipNetworkProfileCheck; Set-Item WSMan:\localhost\Client\TrustedHosts -Value "DC01,DC01.{{ domain_name }},*.{{ domain_name }}" -Force; Enable-WSManCredSSP -Role Server -Force }' \
         -e @group_vars/windows.yml
 
-    print_status "Configuring CredSSP on DC..."
+    print_status "Enabling CredSSP client role on DC (delegating to SQL01)..."
     ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
         -a 'Enable-WSManCredSSP -Role Client -DelegateComputer "SQL01.{{ domain_name }}","*.{{ domain_name }}" -Force' \
         -e @group_vars/windows.yml
 
-    print_status "Configuring credential delegation policy..."
+    print_status "Configuring credential delegation policy on DC..."
     ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
         -a '$null = New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation" -Force; $null = New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation\AllowFreshCredentials" -Force; $null = New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation\AllowFreshCredentialsWhenNTLMOnly" -Force; Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation" -Name "AllowFreshCredentials" -Value 1 -Type DWord; Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation" -Name "ConcatenateDefaults_AllowFresh" -Value 1 -Type DWord; Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation" -Name "AllowFreshCredentialsWhenNTLMOnly" -Value 1 -Type DWord; Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation" -Name "ConcatenateDefaults_AllowFreshNTLMOnly" -Value 1 -Type DWord; Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation\AllowFreshCredentials" -Name "1" -Value "WSMAN/*.{{ domain_name }}" -Type String; Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation\AllowFreshCredentialsWhenNTLMOnly" -Name "1" -Value "WSMAN/*.{{ domain_name }}" -Type String; gpupdate /force' \
         -e @group_vars/windows.yml
+
+    cd "$PROJECT_DIR"
+}
+
+# Phase 4 — Step 4: Configure the RDS deployment on SQL01 (deployment + Web Access)
+# CredSSP is already configured by configure_credssp() in Step 4.0
+configure_rds_deployment() {
+    print_status "Configuring RDS deployment..."
+
+    cd "$PROJECT_DIR/ansible"
 
     print_status "Checking RDS deployment status..."
     ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
@@ -2565,6 +2578,10 @@ deploy_rds() {
     echo "=================================================="
     echo "Phase 4: RDS Deployment"
     echo "=================================================="
+
+    print_status "Step 4.0: Configuring CredSSP credential delegation"
+    configure_credssp
+    echo ""
 
     print_status "Step 4.1: Installing Chocolatey"
     install_chocolatey
