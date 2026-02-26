@@ -2403,13 +2403,50 @@ configure_rds_deployment() {
         --output json 2>&1)
     echo "$rds_state_result" | jq -r '.value[0].message // ""'
 
+    # Two-step approach: write PS1 file to SQL01, then run via scheduled task using -File.
+    # This avoids nested bash/PowerShell escaping issues with -Command $script patterns.
+    print_status "Writing RDS deployment script to SQL01..."
+    local rds_write_script
+    rds_write_script="\$content = @'
+Import-Module RemoteDesktop
+\$outFile = 'C:\\Windows\\Temp\\rds-deploy-out.txt'
+try {
+    New-RDSessionDeployment -ConnectionBroker 'SQL01.${DOMAIN_NAME}' -SessionHost 'SQL01.${DOMAIN_NAME}' -ErrorAction Stop
+    'RDS_CREATED' | Out-File -FilePath \$outFile -Encoding UTF8
+} catch {
+    if (\$_.Exception.Message -like '*already*') {
+        'RDS_EXISTS' | Out-File -FilePath \$outFile -Encoding UTF8
+    } else {
+        \$_.Exception.Message | Out-File -FilePath \$outFile -Encoding UTF8
+    }
+}
+'@
+Set-Content -Path 'C:\\Windows\\Temp\\rds-deploy.ps1' -Value \$content -Encoding UTF8"
+    az vm run-command invoke \
+        --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+        --name "vm-sql-$ENVIRONMENT" \
+        --command-id RunPowerShellScript \
+        --scripts "$rds_write_script" \
+        --output json > /dev/null
+
     print_status "Creating RDS deployment via scheduled task (domain admin context)..."
     local rds_deploy_result
+    local rds_run_script
+    rds_run_script="\$adminUser = '${DOMAIN_NETBIOS_NAME}\\${ADMIN_USERNAME}'
+\$adminPass = '${ADMIN_PASSWORD}'
+\$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\\Windows\\Temp\\rds-deploy.ps1'
+\$principal = New-ScheduledTaskPrincipal -UserId \$adminUser -LogonType Password -RunLevel Highest
+Register-ScheduledTask -TaskName 'RDSDeploy' -Action \$action -Principal \$principal -Force | Out-Null
+Set-ScheduledTask -TaskName 'RDSDeploy' -User \$adminUser -Password \$adminPass | Out-Null
+Start-ScheduledTask -TaskName 'RDSDeploy'
+\$i=0; while ((Get-ScheduledTask -TaskName 'RDSDeploy').State -ne 'Ready' -and \$i -lt 30) { Start-Sleep 10; \$i++ }
+Unregister-ScheduledTask -TaskName 'RDSDeploy' -Confirm:\$false
+if (Test-Path 'C:\\Windows\\Temp\\rds-deploy-out.txt') { Get-Content 'C:\\Windows\\Temp\\rds-deploy-out.txt' } else { 'RDS_NO_OUTPUT' }"
     rds_deploy_result=$(az vm run-command invoke \
         --resource-group "rg-beyondtrust-$ENVIRONMENT" \
         --name "vm-sql-$ENVIRONMENT" \
         --command-id RunPowerShellScript \
-        --scripts "\$adminUser = '$DOMAIN_NETBIOS_NAME\\$ADMIN_USERNAME'; \$adminPass = '$ADMIN_PASSWORD'; \$outFile = 'C:\\Windows\\Temp\\rds-deploy-out.txt'; \$script = 'Import-Module RemoteDesktop; try { New-RDSessionDeployment -ConnectionBroker SQL01.$DOMAIN_NAME -SessionHost SQL01.$DOMAIN_NAME -ErrorAction Stop; \"RDS_CREATED\" | Out-File -FilePath $outFile } catch { if (\$_.Exception.Message -like \"*already*\") { \"RDS_EXISTS\" | Out-File -FilePath $outFile } else { \$_.Exception.Message | Out-File -FilePath $outFile; exit 1 } }'; \$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument \"-NoProfile -ExecutionPolicy Bypass -Command \$script\"; \$principal = New-ScheduledTaskPrincipal -UserId \$adminUser -LogonType Password -RunLevel Highest; Register-ScheduledTask -TaskName 'RDSDeploy' -Action \$action -Principal \$principal -Force | Out-Null; \$taskPwd = ConvertTo-SecureString \$adminPass -AsPlainText -Force; Set-ScheduledTask -TaskName 'RDSDeploy' -User \$adminUser -Password \$adminPass | Out-Null; Start-ScheduledTask -TaskName 'RDSDeploy'; \$i=0; while ((Get-ScheduledTask -TaskName 'RDSDeploy').State -ne 'Ready' -and \$i -lt 30) { Start-Sleep 10; \$i++ }; Unregister-ScheduledTask -TaskName 'RDSDeploy' -Confirm:\$false; if (Test-Path \$outFile) { Get-Content \$outFile } else { 'RDS_NO_OUTPUT' }" \
+        --scripts "$rds_run_script" \
         --output json 2>&1)
 
     local rds_deploy_msg
@@ -2419,12 +2456,47 @@ configure_rds_deployment() {
     if echo "$rds_deploy_msg" | grep -q "RDS_CREATED\|RDS_EXISTS"; then
         print_status "RDS deployment is ready"
 
-        print_status "Adding Web Access role..."
+        print_status "Writing Web Access script to SQL01..."
+        local rds_web_write_script
+        rds_web_write_script="\$content = @'
+Import-Module RemoteDesktop
+\$outFile = 'C:\\Windows\\Temp\\rds-webaccess-out.txt'
+try {
+    Add-RDServer -Server 'SQL01.${DOMAIN_NAME}' -Role RDS-WEB-ACCESS -ConnectionBroker 'SQL01.${DOMAIN_NAME}' -ErrorAction Stop
+    'WEB_ACCESS_ADDED' | Out-File -FilePath \$outFile -Encoding UTF8
+} catch {
+    if (\$_.Exception.Message -like '*already*') {
+        'WEB_ACCESS_EXISTS' | Out-File -FilePath \$outFile -Encoding UTF8
+    } else {
+        \$_.Exception.Message | Out-File -FilePath \$outFile -Encoding UTF8
+    }
+}
+'@
+Set-Content -Path 'C:\\Windows\\Temp\\rds-webaccess.ps1' -Value \$content -Encoding UTF8"
         az vm run-command invoke \
             --resource-group "rg-beyondtrust-$ENVIRONMENT" \
             --name "vm-sql-$ENVIRONMENT" \
             --command-id RunPowerShellScript \
-            --scripts "\$adminUser = '$DOMAIN_NETBIOS_NAME\\$ADMIN_USERNAME'; \$adminPass = '$ADMIN_PASSWORD'; \$outFile = 'C:\\Windows\\Temp\\rds-webaccess-out.txt'; \$script = 'Import-Module RemoteDesktop; try { Add-RDServer -Server SQL01.$DOMAIN_NAME -Role RDS-WEB-ACCESS -ConnectionBroker SQL01.$DOMAIN_NAME -ErrorAction Stop; \"WEB_ACCESS_ADDED\" | Out-File -FilePath $outFile } catch { if (\$_.Exception.Message -like \"*already*\") { \"WEB_ACCESS_EXISTS\" | Out-File -FilePath $outFile } else { \$_.Exception.Message | Out-File -FilePath $outFile } }'; \$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument \"-NoProfile -ExecutionPolicy Bypass -Command \$script\"; \$principal = New-ScheduledTaskPrincipal -UserId \$adminUser -LogonType Password -RunLevel Highest; Register-ScheduledTask -TaskName 'RDSWebAccess' -Action \$action -Principal \$principal -Force | Out-Null; Set-ScheduledTask -TaskName 'RDSWebAccess' -User \$adminUser -Password \$adminPass | Out-Null; Start-ScheduledTask -TaskName 'RDSWebAccess'; \$i=0; while ((Get-ScheduledTask -TaskName 'RDSWebAccess').State -ne 'Ready' -and \$i -lt 30) { Start-Sleep 10; \$i++ }; Unregister-ScheduledTask -TaskName 'RDSWebAccess' -Confirm:\$false; if (Test-Path \$outFile) { Get-Content \$outFile } else { 'WEB_NO_OUTPUT' }" \
+            --scripts "$rds_web_write_script" \
+            --output json > /dev/null
+
+        print_status "Adding Web Access role..."
+        local rds_web_run_script
+        rds_web_run_script="\$adminUser = '${DOMAIN_NETBIOS_NAME}\\${ADMIN_USERNAME}'
+\$adminPass = '${ADMIN_PASSWORD}'
+\$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\\Windows\\Temp\\rds-webaccess.ps1'
+\$principal = New-ScheduledTaskPrincipal -UserId \$adminUser -LogonType Password -RunLevel Highest
+Register-ScheduledTask -TaskName 'RDSWebAccess' -Action \$action -Principal \$principal -Force | Out-Null
+Set-ScheduledTask -TaskName 'RDSWebAccess' -User \$adminUser -Password \$adminPass | Out-Null
+Start-ScheduledTask -TaskName 'RDSWebAccess'
+\$i=0; while ((Get-ScheduledTask -TaskName 'RDSWebAccess').State -ne 'Ready' -and \$i -lt 30) { Start-Sleep 10; \$i++ }
+Unregister-ScheduledTask -TaskName 'RDSWebAccess' -Confirm:\$false
+if (Test-Path 'C:\\Windows\\Temp\\rds-webaccess-out.txt') { Get-Content 'C:\\Windows\\Temp\\rds-webaccess-out.txt' } else { 'WEB_NO_OUTPUT' }"
+        az vm run-command invoke \
+            --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+            --name "vm-sql-$ENVIRONMENT" \
+            --command-id RunPowerShellScript \
+            --scripts "$rds_web_run_script" \
             --output json 2>&1 | jq -r '.value[0].message // ""'
     else
         print_error "Failed to create RDS deployment. Output: $rds_deploy_msg"
@@ -2440,13 +2512,54 @@ publish_ssms_remoteapp() {
     # We use az vm run-command + scheduled task for domain-admin context,
     # same pattern as configure_rds_deployment().
 
+    # Two-step: write PS1 to SQL01 disk, then run via scheduled task using -File.
+    print_status "Writing RemoteApp script to SQL01..."
+    local remoteapp_write_script
+    remoteapp_write_script="\$content = @'
+Import-Module RemoteDesktop
+\$broker = 'SQL01.${DOMAIN_NAME}'
+\$outFile = 'C:\\Windows\\Temp\\remoteapp-out.txt'
+try {
+    \$existing = Get-RDSessionCollection -CollectionName RemoteApps -ConnectionBroker \$broker -ErrorAction SilentlyContinue
+    if (-not \$existing) {
+        New-RDSessionCollection -CollectionName RemoteApps -SessionHost \$broker -ConnectionBroker \$broker -CollectionDescription 'Remote Applications Collection' -ErrorAction Stop
+    }
+    \$ssmsPath = Get-ChildItem -Path 'C:\\Program Files (x86)\\Microsoft SQL Server Management Studio*','C:\\Program Files\\Microsoft SQL Server Management Studio*' -Filter Ssms.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+    if (-not \$ssmsPath) { 'SSMS_NOT_FOUND' | Out-File \$outFile; exit 1 }
+    try { Remove-RDRemoteApp -CollectionName RemoteApps -Alias SSMS -ConnectionBroker \$broker -Force -ErrorAction SilentlyContinue } catch {}
+    New-RDRemoteApp -CollectionName RemoteApps -DisplayName 'SQL Server Management Studio' -FilePath \$ssmsPath -Alias SSMS -ShowInWebAccess \$true -ConnectionBroker \$broker -IconPath C:\\Windows\\System32\\shell32.dll -IconIndex 0
+    'REMOTEAPP_OK' | Out-File \$outFile
+} catch {
+    \$_.Exception.Message | Out-File \$outFile
+    exit 1
+}
+'@
+Set-Content -Path 'C:\\Windows\\Temp\\remoteapp.ps1' -Value \$content -Encoding UTF8"
+    az vm run-command invoke \
+        --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+        --name "vm-sql-$ENVIRONMENT" \
+        --command-id RunPowerShellScript \
+        --scripts "$remoteapp_write_script" \
+        --output json > /dev/null
+
     print_status "Creating RemoteApp session collection and publishing SSMS..."
     local remoteapp_result
+    local remoteapp_run_script
+    remoteapp_run_script="\$adminUser = '${DOMAIN_NETBIOS_NAME}\\${ADMIN_USERNAME}'
+\$adminPass = '${ADMIN_PASSWORD}'
+\$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\\Windows\\Temp\\remoteapp.ps1'
+\$principal = New-ScheduledTaskPrincipal -UserId \$adminUser -LogonType Password -RunLevel Highest
+Register-ScheduledTask -TaskName 'RDSRemoteApp' -Action \$action -Principal \$principal -Force | Out-Null
+Set-ScheduledTask -TaskName 'RDSRemoteApp' -User \$adminUser -Password \$adminPass | Out-Null
+Start-ScheduledTask -TaskName 'RDSRemoteApp'
+\$i=0; while ((Get-ScheduledTask -TaskName 'RDSRemoteApp').State -ne 'Ready' -and \$i -lt 30) { Start-Sleep 10; \$i++ }
+Unregister-ScheduledTask -TaskName 'RDSRemoteApp' -Confirm:\$false
+if (Test-Path 'C:\\Windows\\Temp\\remoteapp-out.txt') { Get-Content 'C:\\Windows\\Temp\\remoteapp-out.txt' } else { 'NO_OUTPUT' }"
     remoteapp_result=$(az vm run-command invoke \
         --resource-group "rg-beyondtrust-$ENVIRONMENT" \
         --name "vm-sql-$ENVIRONMENT" \
         --command-id RunPowerShellScript \
-        --scripts "\$adminUser = '$DOMAIN_NETBIOS_NAME\\$ADMIN_USERNAME'; \$adminPass = '$ADMIN_PASSWORD'; \$outFile = 'C:\\Windows\\Temp\\remoteapp-out.txt'; \$script = 'Import-Module RemoteDesktop; \$broker = \"SQL01.$DOMAIN_NAME\"; try { \$existing = Get-RDSessionCollection -CollectionName RemoteApps -ConnectionBroker \$broker -ErrorAction SilentlyContinue; if (-not \$existing) { New-RDSessionCollection -CollectionName RemoteApps -SessionHost \$broker -ConnectionBroker \$broker -CollectionDescription \"Remote Applications Collection\" -ErrorAction Stop }; \$ssmsPath = Get-ChildItem -Path \"C:\\Program Files (x86)\\Microsoft SQL Server Management Studio*\",\"C:\\Program Files\\Microsoft SQL Server Management Studio*\" -Filter Ssms.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName; if (-not \$ssmsPath) { \"SSMS_NOT_FOUND\" | Out-File \$outFile; exit 1 }; try { Remove-RDRemoteApp -CollectionName RemoteApps -Alias SSMS -ConnectionBroker \$broker -Force -ErrorAction SilentlyContinue } catch {}; New-RDRemoteApp -CollectionName RemoteApps -DisplayName \"SQL Server Management Studio\" -FilePath \$ssmsPath -Alias SSMS -ShowInWebAccess \$true -ConnectionBroker \$broker -IconPath C:\\Windows\\System32\\shell32.dll -IconIndex 0; \"REMOTEAPP_OK\" | Out-File \$outFile } catch { \$_.Exception.Message | Out-File \$outFile; exit 1 }'; \$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument \"-NoProfile -ExecutionPolicy Bypass -Command \$script\"; \$principal = New-ScheduledTaskPrincipal -UserId \$adminUser -LogonType Password -RunLevel Highest; Register-ScheduledTask -TaskName 'RDSRemoteApp' -Action \$action -Principal \$principal -Force | Out-Null; Set-ScheduledTask -TaskName 'RDSRemoteApp' -User \$adminUser -Password \$adminPass | Out-Null; Start-ScheduledTask -TaskName 'RDSRemoteApp'; \$i=0; while ((Get-ScheduledTask -TaskName 'RDSRemoteApp').State -ne 'Ready' -and \$i -lt 30) { Start-Sleep 10; \$i++ }; Unregister-ScheduledTask -TaskName 'RDSRemoteApp' -Confirm:\$false; if (Test-Path \$outFile) { Get-Content \$outFile } else { 'NO_OUTPUT' }" \
+        --scripts "$remoteapp_run_script" \
         --output json 2>&1)
 
     local remoteapp_msg
