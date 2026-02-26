@@ -178,6 +178,11 @@ APPROVER_EMAIL=""
 # Resource Prefix (to ensure uniqueness)
 RESOURCE_PREFIX="Demo_"
 
+# Vault Account Group ID
+# Find this in the BeyondTrust console: Vault -> Account Groups
+# Select the group you want demo accounts assigned to and note its ID
+VAULT_ACCOUNT_GROUP_ID="4"
+
 # Optional: Override default BeyondTrust resource names
 # JUMP_GROUP_DEMO="Demo Servers"
 # JUMP_GROUP_DC="Domain Controllers"
@@ -218,11 +223,12 @@ validate_config() {
     JUMP_GROUP_DEMO="${RESOURCE_PREFIX}${JUMP_GROUP_DEMO:-Demo Servers}"
     JUMP_GROUP_DC="${RESOURCE_PREFIX}${JUMP_GROUP_DC:-Domain Controllers}"
     JUMPOINT_NAME="${RESOURCE_PREFIX}${JUMPOINT_NAME:-DC01_Jumpoint}"
-    
+    VAULT_ACCOUNT_GROUP_ID="${VAULT_ACCOUNT_GROUP_ID:-4}"
+
     # EXPORT ALL VARIABLES (FIX)
     export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET APPROVER_EMAIL RESOURCE_PREFIX
     export DOMAIN_NAME DOMAIN_NETBIOS_NAME ADMIN_USERNAME ADMIN_PASSWORD
-    export JUMP_GROUP_DEMO JUMP_GROUP_DC JUMPOINT_NAME
+    export JUMP_GROUP_DEMO JUMP_GROUP_DC JUMPOINT_NAME VAULT_ACCOUNT_GROUP_ID
     
     print_status "Configuration validated successfully"
 }
@@ -1124,7 +1130,8 @@ deploy_beyondtrust() {
     source "$CONFIG_FILE"
     export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET RESOURCE_PREFIX APPROVER_EMAIL
     export JUMP_GROUP_DEMO JUMP_GROUP_DC JUMPOINT_NAME ADMIN_USERNAME ADMIN_PASSWORD DOMAIN_NAME
-    
+    export VAULT_ACCOUNT_GROUP_ID
+
     # Update state
     update_metadata "beyondtrust_instance" "$BT_API_HOST"
     update_metadata "resource_prefix" "$RESOURCE_PREFIX"
@@ -1221,6 +1228,7 @@ source "$CONFIG_FILE"
 # Export all BeyondTrust variables
 export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET APPROVER_EMAIL RESOURCE_PREFIX
 export DOMAIN_NAME DOMAIN_NETBIOS_NAME ADMIN_USERNAME ADMIN_PASSWORD
+export VAULT_ACCOUNT_GROUP_ID="${VAULT_ACCOUNT_GROUP_ID:-4}"
 export JUMP_GROUP_DEMO="${RESOURCE_PREFIX}Demo Servers"
 export JUMP_GROUP_DC="${RESOURCE_PREFIX}Domain Controllers"
 export JUMPOINT_NAME="${RESOURCE_PREFIX}DC01_Jumpoint"
@@ -1696,13 +1704,13 @@ create_sql_jump_item() {
     "comments": "SQL server requiring approval",
     "domain": "$DOMAIN_NAME",
     "jump_policy_id": $APPROVAL_POLICY_ID,
-    "session_forensics": true
+    "session_forensics": false
 }
 JSON
 )
-    
+
     local response=$(api_call "POST" "/jump-item/remote-rdp" "$jump_item_data")
-    
+
     # Track in state file
     local item_id=$(echo "$response" | jq -r '.id')
     local item_name=$(echo "$response" | jq -r '.name')
@@ -1768,13 +1776,13 @@ create_dc_jump_item() {
     "comments": "Domain controller with direct access",
     "domain": "$DOMAIN_NAME",
     "jump_policy_id": $DIRECT_POLICY_ID,
-    "session_forensics": true
+    "session_forensics": false
 }
 JSON
 )
-    
+
     local response=$(api_call "POST" "/jump-item/remote-rdp" "$jump_item_data")
-    
+
     # Track in state file
     local item_id=$(echo "$response" | jq -r '.id')
     local item_name=$(echo "$response" | jq -r '.name')
@@ -1874,7 +1882,7 @@ create_vault_account() {
     "username": "$escaped_username",
     "password": "$password",
     "description": "Demo environment account created by script",
-    "account_group_id": 4
+    "account_group_id": ${VAULT_ACCOUNT_GROUP_ID:-4}
 }
 JSON
 )
