@@ -6,9 +6,9 @@
 # removed unnecessary data disk, reduced OS disk sizes, and Basic SKU public IP
 #
 # Usage:
-#   ./deploy-updated.sh                  # First run creates config, second run deploys
-#   ./deploy-updated.sh --cleanup        # Remove only resources created by this script
-#   ./deploy-updated.sh --with-rds       # Also deploy RDS roles and publish SSMS RemoteApp
+#   ./deploy-infra.sh                  # First run creates config, second run deploys
+#   ./deploy-infra.sh --cleanup        # Remove only resources created by this script
+#   ./deploy-infra.sh --with-rds       # Also deploy RDS roles and publish SSMS RemoteApp
 
 set -e
 
