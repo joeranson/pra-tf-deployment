@@ -1376,7 +1376,7 @@ create_beyondtrust_state_helper() {
 #!/bin/bash
 # State file helper for BeyondTrust resources
 # NOTE: add_bt_resource and get_bt_resources mirror the add_resource/get_resources
-# functions defined in deploy-updated.sh. Keep them in sync if the logic changes.
+# functions defined in deploy-infra.sh. Keep them in sync if the logic changes.
 
 # Derive an absolute path to the state file regardless of working directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -2605,7 +2605,7 @@ JSON
         echo "$result" | jq . 2>/dev/null || echo "$result"
     fi
 
-    # Full desktop jump item for SQL01 is already created by deploy-updated.sh Phase 3
+    # Full desktop jump item for SQL01 is already created by deploy-infra.sh Phase 3
     print_status "Full desktop jump item for SQL01 already created by Phase 3, skipping..."
 }
 
@@ -2655,7 +2655,7 @@ deploy_rds() {
     print_status "To jump via RemoteApp: BeyondTrust Console > Jump Items > 'SSMS RemoteApp on SQL01'"
     echo ""
     print_status "To remove everything, run:"
-    print_status "  ./deploy-updated.sh --cleanup"
+    print_status "  ./deploy-infra.sh --cleanup"
     print_status "  (RDS components live on the VMs and are destroyed with them)"
 }
 
@@ -2849,7 +2849,7 @@ main() {
     echo "State File: $STATE_FILE"
     echo ""
     echo "To destroy everything, run:"
-    echo "  ./deploy-updated.sh --cleanup"
+    echo "  ./deploy-infra.sh --cleanup"
     echo "  (RDS components, if deployed, are removed with the VMs automatically)"
     echo "============================================================"
 }
