@@ -156,13 +156,12 @@ Format: `username:FirstName:LastName:Password`
 
 ## Cleanup
 
-To remove all BeyondTrust resources created by the deployment (jump items, vault accounts, policies) while leaving Azure infrastructure intact:
+To remove all resources created by the deployment:
 
 ```bash
 ./deploy-updated.sh --cleanup
 ```
 
-To also destroy Azure infrastructure, run `terraform destroy` inside `~/beyondtrust-demo/terraform/` after cleanup.
 
 ---
 
