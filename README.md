@@ -57,7 +57,7 @@ cd pra-tf-deployment
 Run the deployment script once. On first run it detects no configuration exists and creates a template at `~/beyondtrust-demo/config.env`, then exits:
 
 ```bash
-./deploy-updated.sh
+./deploy-infra.sh
 ```
 
 ### Step 3 — Edit the configuration file
@@ -85,7 +85,7 @@ See the [Configuration Reference](#configuration-reference) section below for a 
 Run the script again. It will log in to Azure, provision infrastructure with Terraform, configure Windows VMs via Ansible, and set up BeyondTrust resources:
 
 ```bash
-./deploy-updated.sh
+./deploy-infra.sh
 ```
 
 The full deployment typically takes 20–35 minutes. Progress is printed to the terminal at each phase.
@@ -95,7 +95,7 @@ The full deployment typically takes 20–35 minutes. Progress is printed to the 
 To also publish SSMS as a RemoteApp through RDS on SQL01:
 
 ```bash
-./deploy-updated.sh --with-rds
+./deploy-infra.sh --with-rds
 ```
 
 ---
@@ -159,7 +159,7 @@ Format: `username:FirstName:LastName:Password`
 To remove all resources created by the deployment:
 
 ```bash
-./deploy-updated.sh --cleanup
+./deploy-infra.sh --cleanup
 ```
 
 
