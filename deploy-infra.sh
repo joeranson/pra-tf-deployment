@@ -1794,7 +1794,7 @@ JSON
     cd - > /dev/null
 }
 
-# Create and download Linux Jump Client installer (.deb)
+# Create and download Linux Jump Client installer (.sh shell script, linux64-x86)
 create_linux_jump_client() {
     echo "Creating Linux Jump Client installer..."
 
@@ -1830,29 +1830,23 @@ JSON
     echo "Created Linux installer with ID: $installer_id"
 
     # Track installer creation (same resource type as Windows — cleanup handles both)
-    add_bt_resource "jump_client_installer" "$installer_id" "${RESOURCE_PREFIX}Ubuntu01_JumpClient" '{"type": "deb", "platform": "linux-64-deb"}'
+    add_bt_resource "jump_client_installer" "$installer_id" "${RESOURCE_PREFIX}Ubuntu01_JumpClient" '{"type": "sh", "platform": "linux64-x86"}'
 
-    # Extract key_info for Linux 64-bit DEB (fall back to tar if deb not present)
+    # Extract key_info for Linux 64-bit x86 shell script installer
     local key_info=$(echo "$response" | jq -r '
-        .key_info."linux-64-deb".encodedInfo //
-        .key_info."linux-64-tar".encodedInfo //
+        .key_info."linux64-x86".encodedInfo //
         empty')
     if [ -n "$key_info" ]; then
         echo "$key_info" > ../downloads/jumpclient-linux-keyinfo.txt
         echo "Key info extracted for Linux 64-bit installer"
     else
-        echo "ERROR: No key info found for linux-64-deb or linux-64-tar platform"
+        echo "ERROR: No key info found for linux64-x86 platform"
         echo "Available platforms: $(echo "$response" | jq -r '.key_info | keys[]' 2>/dev/null)"
         return 1
     fi
 
-    # Determine which platform key was available and use the right download URL
-    local platform="linux-64-deb"
-    if ! echo "$response" | jq -e '.key_info."linux-64-deb"' > /dev/null 2>&1; then
-        platform="linux-64-tar"
-    fi
-
-    # Download the installer
+    # Download the linux64-x86 shell script installer
+    local platform="linux64-x86"
     echo "Downloading Linux Jump Client installer (${platform})..."
     local token=$(get_api_token)
 
@@ -1861,8 +1855,8 @@ JSON
     curl -s -J -O -H "Authorization: Bearer $token" \
         "$BT_API_HOST/api/config/v1/jump-client/installer/$installer_id/${platform}"
 
-    # Find the downloaded file (.deb or .tar.gz)
-    local filename=$(ls -t *.deb *.tar.gz 2>/dev/null | head -n1)
+    # Find the downloaded file (.sh shell script)
+    local filename=$(ls -t *.sh 2>/dev/null | head -n1)
 
     if [ -n "$filename" ]; then
         local filesize=$(stat -c%s "$filename" 2>/dev/null || stat -f%z "$filename" 2>/dev/null)
@@ -2572,12 +2566,12 @@ create_beyondtrust_ansible_playbook() {
       ansible.builtin.copy:
         src: "{{ bt_downloads_dir }}/{{ linux_jumpclient_filename }}"
         dest: "/tmp/beyondtrust/{{ linux_jumpclient_filename }}"
-        mode: '0644'
+        mode: '0755'
       register: copy_linux_jumpclient
 
     - name: Install Linux Jump Client
       ansible.builtin.shell: |
-        KEY_INFO="{{ linux_jumpclient_keyinfo }}" dpkg -i /tmp/beyondtrust/{{ linux_jumpclient_filename }}
+        /tmp/beyondtrust/{{ linux_jumpclient_filename }}
       environment:
         KEY_INFO: "{{ linux_jumpclient_keyinfo }}"
       register: linux_install
