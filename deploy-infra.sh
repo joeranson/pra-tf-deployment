@@ -911,6 +911,8 @@ all:
       hosts:
         ubuntu:
           ansible_host: 10.0.3.10
+          ansible_connection: ssh
+          ansible_port: 22
           ansible_user: $LINUX_ADMIN_USERNAME
           ansible_password: "$LINUX_ADMIN_PASSWORD"
           ansible_become: yes
@@ -2085,7 +2087,7 @@ create_ubuntu_shell_jump_item() {
     "name": "${RESOURCE_PREFIX}Ubuntu01 - SSH",
     "hostname": "$UBUNTU_PRIVATE_IP",
     "port": 22,
-    "protocol": "SSH",
+    "protocol": "ssh",
     "jumpoint_id": $JUMPOINT_ID,
     "jump_group_id": $LINUX_GROUP_ID,
     "jump_group_type": "shared",
