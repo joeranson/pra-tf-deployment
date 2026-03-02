@@ -1373,7 +1373,7 @@ fi
 echo \"Found installer: \$INSTALLER\"
 chmod +x \"\$INSTALLER\"
 echo 'Installing Jump Client...'
-KEY_INFO='${bt_key_info}' \"\$INSTALLER\"
+KEY_INFO='${bt_key_info}' \"\$INSTALLER\" --headless --startup systemd --install-dir /opt/beyondtrust/jumpclient
 echo 'Jump Client installation complete'"
 
             local run_result
