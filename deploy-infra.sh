@@ -1359,13 +1359,21 @@ deploy_beyondtrust() {
             print_warning "Failed to get BeyondTrust API token — skipping Ubuntu Jump Client installation"
         else
             local ubuntu_script
-            ubuntu_script="set -e
-echo 'Downloading Jump Client installer from BeyondTrust...'
-curl -sf -o /tmp/jc.bin -H 'Authorization: Bearer ${bt_token}' '${BT_API_HOST}/api/config/v1/jump-client/installer/${bt_installer_id}/linux-64'
-chmod +x /tmp/jc.bin
+            ubuntu_script="echo 'Downloading Jump Client installer from BeyondTrust...'
+touch /tmp/jc_before
+cd /tmp
+curl -sf -J -O -H 'Authorization: Bearer ${bt_token}' '${BT_API_HOST}/api/config/v1/jump-client/installer/${bt_installer_id}/linux-64'
+INSTALLER=\$(find /tmp -maxdepth 1 -newer /tmp/jc_before -type f 2>/dev/null | head -1)
+rm -f /tmp/jc_before
+if [ -z \"\$INSTALLER\" ]; then
+  echo 'ERROR: installer not found after download'
+  ls -la /tmp/
+  exit 1
+fi
+echo \"Found installer: \$INSTALLER\"
+chmod +x \"\$INSTALLER\"
 echo 'Installing Jump Client...'
-KEY_INFO='${bt_key_info}' /tmp/jc.bin --silent
-rm -f /tmp/jc.bin
+KEY_INFO='${bt_key_info}' \"\$INSTALLER\"
 echo 'Jump Client installation complete'"
 
             local run_result
