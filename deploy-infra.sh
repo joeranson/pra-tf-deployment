@@ -581,6 +581,14 @@ resource "azurerm_public_ip" "dc" {
   sku                 = "Standard"
 }
 
+resource "azurerm_public_ip" "ubuntu" {
+  name                = "pip-ubuntu-${var.environment}"
+  resource_group_name = azurerm_resource_group.demo.name
+  location            = azurerm_resource_group.demo.location
+  allocation_method   = "Static"
+  sku                 = "Standard"
+}
+
 # NICs
 resource "azurerm_network_interface" "dc" {
   name                = "nic-dc-${var.environment}"
@@ -621,6 +629,7 @@ resource "azurerm_network_interface" "ubuntu" {
     subnet_id                     = azurerm_subnet.linux.id
     private_ip_address_allocation = "Static"
     private_ip_address            = "10.0.3.10"
+    public_ip_address_id          = azurerm_public_ip.ubuntu.id
   }
 }
 
@@ -790,8 +799,8 @@ output "dc_public_ip" {
   value = azurerm_public_ip.dc.ip_address
 }
 
-output "ubuntu_private_ip" {
-  value = azurerm_network_interface.ubuntu.private_ip_address
+output "ubuntu_public_ip" {
+  value = azurerm_public_ip.ubuntu.ip_address
 }
 
 output "deployment_info" {

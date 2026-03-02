@@ -7,17 +7,18 @@ Automated deployment of a complete BeyondTrust Privileged Remote Access (PRA) de
 ## What Gets Deployed
 
 - **Azure Infrastructure**
-  - Resource group, virtual network, and subnets
-  - Domain Controller VM (DC01) — Windows Server with Active Directory
+  - Resource group, virtual network, and three subnets
+  - Domain Controller VM (DC01) — Windows Server with Active Directory (public IP)
   - SQL Server VM (SQL01) — Windows Server with SQL Server 2019 Developer Edition
+  - Ubuntu VM (Ubuntu01) — Ubuntu 24.04 LTS with BeyondTrust Jump Client (public IP)
   - Network security groups with appropriate firewall rules
 
 - **BeyondTrust PRA Configuration**
   - Jumpoint installed on DC01
-  - Jump groups for demo servers and domain controllers
-  - Jump items: SQL Server RDP, DC01 RDP, IIS Web Portal, MSSQL protocol tunnel
-  - Jump policies: approval-required (SQL) and direct access (DC)
-  - Vault accounts for domain admin and demo users (jsmith, mjohnson, bdavis)
+  - Jump groups for demo servers, domain controllers, and Linux servers
+  - Jump items: SQL Server RDP, DC01 RDP, IIS Web Portal, MSSQL protocol tunnel, Ubuntu01 SSH Shell Jump, Ubuntu01 Jump Client
+  - Jump policies: approval-required (SQL + Linux) and direct access (DC)
+  - Vault accounts for domain admin, demo users (jsmith, mjohnson, bdavis), and Ubuntu local admin (linuxadmin)
 
 - **Optional: RDS / RemoteApp** (via `--with-rds`)
   - RDS role on SQL01
@@ -128,7 +129,15 @@ All variables live in `~/beyondtrust-demo/config.env`.
 | `VAULT_ACCOUNT_GROUP_ID` | `4` | Yes | Numeric ID of the vault account group that demo accounts are assigned to. Find it in BeyondTrust console → Vault → Account Groups. |
 | `JUMP_GROUP_DEMO` | `Demo Servers` | No | Name of the jump group for demo servers |
 | `JUMP_GROUP_DC` | `Domain Controllers` | No | Name of the jump group for domain controllers |
-| `JUMPOINT_NAME` | `DC01_Jumpoint` | No | Name of the jumpoint installed on DC01 |
+| `JUMP_GROUP_LINUX` | `Linux Servers` | No | Name of the jump group for Linux servers |
+| `JUMPOINT_NAME` | `DC01_Jumpoint` | No | Name of the Jumpoint installed on DC01 |
+
+### Linux VM Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LINUX_ADMIN_USERNAME` | `linuxadmin` | Local administrator username for the Ubuntu VM |
+| `LINUX_ADMIN_PASSWORD` | `UbuntuPass123!` | Local administrator password for the Ubuntu VM |
 
 ### Demo User Configuration (optional)
 
@@ -170,22 +179,27 @@ To remove all resources created by the deployment:
 ```
 Azure Virtual Network (10.0.0.0/16)
 ├── Subnet 1 (10.0.1.0/24)
-│   └── DC01 (10.0.1.10) — Domain Controller + Jumpoint
-└── Subnet 2 (10.0.2.0/24)
-    └── SQL01 (10.0.2.10) — SQL Server 2019
+│   └── DC01 (10.0.1.10) — Domain Controller + Jumpoint  [public IP]
+├── Subnet 2 (10.0.2.0/24)
+│   └── SQL01 (10.0.2.10) — SQL Server 2019
+└── Subnet 3 (10.0.3.0/24)
+    └── Ubuntu01 (10.0.3.10) — Ubuntu 24.04 + Jump Client  [public IP]
 
 BeyondTrust PRA
 ├── Jumpoint (on DC01) — proxies connections to internal resources
 ├── Jump Groups
 │   ├── Demo Servers       — SQL01 jump items
-│   └── Domain Controllers — DC01 jump items
+│   ├── Domain Controllers — DC01 jump items
+│   └── Linux Servers      — Ubuntu01 jump items
 ├── Jump Items
 │   ├── SQL01 RDP          — approval-required policy
 │   ├── SQL01 IIS Web      — approval-required policy
 │   ├── SQL DB Tunnel      — MSSQL protocol tunnel
-│   └── DC01 RDP           — direct access policy
+│   ├── DC01 RDP           — direct access policy
+│   ├── Ubuntu01 SSH       — Shell Jump via Jumpoint (approval-required)
+│   └── Ubuntu01 JumpClient — Jump Client agent (direct session)
 └── Vault
-    └── Account Group → Domain Admin, jsmith, mjohnson, bdavis
+    └── Account Group → Domain Admin, jsmith, mjohnson, bdavis, linuxadmin
 ```
 
 ---
