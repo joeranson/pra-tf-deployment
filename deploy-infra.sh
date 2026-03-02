@@ -1852,13 +1852,18 @@ JSON
 
     cd ../downloads
 
-    curl -s -J -O -H "Authorization: Bearer $token" \
-        "$BT_API_HOST/api/config/v1/jump-client/installer/$installer_id/${platform}"
+    local filename="jumpclient-linux.sh"
+    local http_code
+    http_code=$(curl -s -o "$filename" -w "%{http_code}" -H "Authorization: Bearer $token" \
+        "$BT_API_HOST/api/config/v1/jump-client/installer/$installer_id/${platform}")
+    if [ "$http_code" != "200" ]; then
+        echo "ERROR: Download failed with HTTP $http_code"
+        rm -f "$filename"
+        cd - > /dev/null
+        return 1
+    fi
 
-    # Find the downloaded file (.sh shell script)
-    local filename=$(ls -t *.sh 2>/dev/null | head -n1)
-
-    if [ -n "$filename" ]; then
+    if [ -f "$filename" ]; then
         local filesize=$(stat -c%s "$filename" 2>/dev/null || stat -f%z "$filename" 2>/dev/null)
         if [ "$filesize" -lt 1000000 ]; then
             echo "ERROR: Linux Jump Client installer too small ($filesize bytes), likely an error response"
