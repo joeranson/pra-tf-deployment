@@ -1335,6 +1335,63 @@ deploy_beyondtrust() {
     fi
     popd > /dev/null
 
+    # Step 4b: Install Jump Client on Ubuntu directly via Azure VM run-command
+    # (bypasses Ansible entirely — avoids WinRM/SSH connection plugin conflicts)
+    print_status "Installing BeyondTrust Jump Client on Ubuntu via Azure run-command..."
+    local downloads_dir="$PROJECT_DIR/beyondtrust/downloads"
+    local key_info_file="$downloads_dir/jumpclient-linux-keyinfo.txt"
+    local installer_id_file="$downloads_dir/jumpclient-linux-installer-id.txt"
+
+    if [ -f "$key_info_file" ] && [ -f "$installer_id_file" ]; then
+        local bt_key_info
+        bt_key_info=$(cat "$key_info_file")
+        local bt_installer_id
+        bt_installer_id=$(cat "$installer_id_file")
+
+        # Get a fresh BeyondTrust API token for the VM to download the installer
+        local bt_token
+        bt_token=$(curl -s -X POST "${BT_API_HOST}/oauth2/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials&client_id=${BT_CLIENT_ID}&client_secret=${BT_CLIENT_SECRET}" \
+            | jq -r '.access_token // empty')
+
+        if [ -z "$bt_token" ]; then
+            print_warning "Failed to get BeyondTrust API token — skipping Ubuntu Jump Client installation"
+        else
+            local ubuntu_script
+            ubuntu_script="set -e
+echo 'Downloading Jump Client installer from BeyondTrust...'
+curl -sf -o /tmp/jc.bin -H 'Authorization: Bearer ${bt_token}' '${BT_API_HOST}/api/config/v1/jump-client/installer/${bt_installer_id}/linux-64'
+chmod +x /tmp/jc.bin
+echo 'Installing Jump Client...'
+KEY_INFO='${bt_key_info}' /tmp/jc.bin --silent
+rm -f /tmp/jc.bin
+echo 'Jump Client installation complete'"
+
+            local run_result
+            run_result=$(az vm run-command invoke \
+                --resource-group "rg-beyondtrust-${ENVIRONMENT}" \
+                --name "vm-ubuntu-${ENVIRONMENT}" \
+                --command-id RunShellScript \
+                --scripts "$ubuntu_script" \
+                --output json 2>&1)
+
+            local az_exit=$?
+            if [ $az_exit -eq 0 ]; then
+                local stdout
+                stdout=$(echo "$run_result" | jq -r '.value[0].message // "completed"' 2>/dev/null)
+                print_status "Ubuntu Jump Client installation output:"
+                echo "$stdout"
+            else
+                print_warning "Azure run-command for Ubuntu returned non-zero exit ($az_exit). Output:"
+                echo "$run_result" | head -20
+            fi
+        fi
+    else
+        print_warning "Linux Jump Client download files not found — skipping Ubuntu installation"
+        print_warning "  Missing: ${key_info_file} or ${installer_id_file}"
+    fi
+
     # Step 5: Configure jump items (using wrapper)
     print_status "Configuring jump items..."
     (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-jump-items.sh)
@@ -1831,6 +1888,7 @@ JSON
     fi
 
     echo "Created Linux installer with ID: $installer_id"
+    echo "$installer_id" > ../downloads/jumpclient-linux-installer-id.txt
 
     # Track installer creation (same resource type as Windows — cleanup handles both)
     add_bt_resource "jump_client_installer" "$installer_id" "${RESOURCE_PREFIX}Ubuntu01_JumpClient" '{"type": "sh", "platform": "linux64-x86"}'
@@ -2544,62 +2602,6 @@ create_beyondtrust_ansible_playbook() {
           - Jumpoint install: {{ 'Success' if jumpoint_install is defined and jumpoint_install.rc == 0 else 'Failed or skipped' }}
           - Jump Client install: {{ 'Success' if jumpclient_install is defined and jumpclient_install.rc == 0 else 'Failed' }}
           - Installation check: {{ install_check.stdout | default('Unable to check') }}
-
-- name: Install BeyondTrust Jump Client on Ubuntu
-  hosts: ubuntu
-  gather_facts: no
-  vars:
-    bt_downloads_dir: "{{ playbook_dir }}/../downloads"
-
-  tasks:
-    - name: Read Linux Jump Client filename
-      set_fact:
-        linux_jumpclient_filename: "{{ lookup('file', bt_downloads_dir + '/jumpclient-linux-filename.txt', errors='ignore') | default('') }}"
-
-    - name: Read Linux Jump Client key info
-      set_fact:
-        linux_jumpclient_keyinfo: "{{ lookup('file', bt_downloads_dir + '/jumpclient-linux-keyinfo.txt', errors='ignore') | default('') }}"
-
-    - name: Fail if no Linux installer was found
-      fail:
-        msg: "Linux Jump Client installer not found. Check download-installers.sh output."
-      when: linux_jumpclient_filename == ''
-
-    - name: Create temp directory on Ubuntu
-      ansible.builtin.file:
-        path: /tmp/beyondtrust
-        state: directory
-        mode: '0755'
-
-    - name: Copy Linux Jump Client installer to Ubuntu
-      ansible.builtin.copy:
-        src: "{{ bt_downloads_dir }}/{{ linux_jumpclient_filename }}"
-        dest: "/tmp/beyondtrust/{{ linux_jumpclient_filename }}"
-        mode: '0755'
-      register: copy_linux_jumpclient
-
-    - name: Install Linux Jump Client
-      ansible.builtin.shell: |
-        /tmp/beyondtrust/{{ linux_jumpclient_filename }}
-      environment:
-        KEY_INFO: "{{ linux_jumpclient_keyinfo }}"
-      register: linux_install
-      when: copy_linux_jumpclient is succeeded and linux_jumpclient_keyinfo != ''
-
-    - name: Allow BeyondTrust outbound ports via ufw
-      ansible.builtin.shell: |
-        ufw allow out 443/tcp comment "BeyondTrust HTTPS" || true
-        ufw allow out 8200/tcp comment "BeyondTrust Service" || true
-      ignore_errors: yes
-
-    - name: Display Ubuntu Jump Client installation status
-      debug:
-        msg: |
-          Linux Jump Client Installation:
-          - Filename: {{ linux_jumpclient_filename }}
-          - Key info present: {{ 'Yes' if linux_jumpclient_keyinfo else 'No' }}
-          - Copy result: {{ 'Success' if copy_linux_jumpclient is succeeded else 'Failed' }}
-          - Install result: {{ linux_install.rc | default('skipped') }}
 EOF
 }
 
