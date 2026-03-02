@@ -906,6 +906,7 @@ all:
     linux:
       vars:
         ansible_connection: ssh
+        ansible_shell_type: sh
         ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o ProxyJump=$ADMIN_USERNAME@$DC_IP'
       hosts:
         ubuntu:
@@ -2084,6 +2085,7 @@ create_ubuntu_shell_jump_item() {
     "name": "${RESOURCE_PREFIX}Ubuntu01 - SSH",
     "hostname": "$UBUNTU_PRIVATE_IP",
     "port": 22,
+    "protocol": "SSH",
     "jumpoint_id": $JUMPOINT_ID,
     "jump_group_id": $LINUX_GROUP_ID,
     "jump_group_type": "shared",
@@ -2543,7 +2545,7 @@ create_beyondtrust_ansible_playbook() {
 
 - name: Install BeyondTrust Jump Client on Ubuntu
   hosts: ubuntu
-  gather_facts: yes
+  gather_facts: no
   vars:
     bt_downloads_dir: "{{ playbook_dir }}/../downloads"
 
