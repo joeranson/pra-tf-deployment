@@ -1845,14 +1845,14 @@ JSON
         return 1
     fi
 
-    # Download the linux64-x86 shell script installer
-    local platform="linux64-x86"
+    # Download the linux-64 .bin installer (API path param is 'linux-64', key_info key is 'linux64-x86')
+    local platform="linux-64"
     echo "Downloading Linux Jump Client installer (${platform})..."
     local token=$(get_api_token)
 
     cd ../downloads
 
-    local filename="jumpclient-linux.sh"
+    local filename="jumpclient-linux.bin"
     local http_code
     http_code=$(curl -s -o "$filename" -w "%{http_code}" -H "Authorization: Bearer $token" \
         "$BT_API_HOST/api/config/v1/jump-client/installer/$installer_id/${platform}")
