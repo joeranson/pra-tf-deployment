@@ -1381,10 +1381,6 @@ if [ -z \"\$INSTALLER\" ]; then
 fi
 echo \"Found installer: \$INSTALLER\"
 chmod +x \"\$INSTALLER\"
-if [ -d /opt/beyondtrust/jumpclient ]; then
-  echo 'Removing previous installation directory...'
-  rm -rf /opt/beyondtrust/jumpclient
-fi
 echo 'Installing Jump Client...'
 \"\$INSTALLER\" --key-info '${bt_key_info}' --headless --scope system --startup systemd --install-dir /opt/beyondtrust/jumpclient --session-user linuxadmin
 INSTALL_RC=\$?
