@@ -944,11 +944,7 @@ EOF
           - RSAT-AD-Tools
         state: present
       register: features
-    
-    - name: Reboot if needed
-      ansible.windows.win_reboot:
-      when: features.reboot_required
-    
+
     - name: Check if already a domain controller
       ansible.windows.win_shell: |
         (Get-WmiObject Win32_ComputerSystem).DomainRole
@@ -1051,10 +1047,7 @@ EOF
             $cred = New-Object PSCredential("$DomainName\$AdminUser", $pass)
            
             Add-Computer -DomainName $DomainName -Credential $cred -Force
-            Write-Output "Domain join successful - restarting in 30 seconds"
-           
-            # Schedule restart
-            shutdown /r /t 30 /c "Restarting to complete domain join"
+            Write-Output "Domain join successful (reboot deferred to end of deployment)"
            
           } catch {
             Write-Output "Error joining domain: $_"
@@ -1070,33 +1063,17 @@ EOF
       debug:
         var: domain_join.stdout_lines
        
-    - name: Wait for SQL restart if joined
-      pause:
-        seconds: 60
-      when: "'Domain join successful' in domain_join.stdout"
-     
-    - name: Final verification
+    - name: Verify SQL01 computer object in AD
       ansible.windows.win_shell: |
-        Start-Sleep -Seconds 30
-       
-        # Check if SQL is in AD
+        # Check if SQL is in AD (domain auth on SQL01 requires reboot, deferred)
         try {
           $computer = Get-ADComputer -Filter "Name -eq 'SQL01'" -ErrorAction Stop
           Write-Output "Found in AD: $($computer.Name) - $($computer.DNSHostName)"
         } catch {
-          Write-Output "Not found in AD yet"
-        }
-       
-        # Try to connect with domain creds
-        $domainCred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", (ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force))
-        try {
-          Test-WSMan -ComputerName SQL01.{{ domain_name }} -Credential $domainCred -Authentication Negotiate
-          Write-Output "Domain authentication working"
-        } catch {
-          Write-Output "Domain auth not ready yet"
+          Write-Output "Not found in AD yet — will be available after SQL01 reboot"
         }
       register: final_check
-     
+
     - name: Show final status
       debug:
         var: final_check.stdout_lines
@@ -1143,57 +1120,58 @@ EOF
             Add-ADGroupMember -Identity "Remote Desktop Users" -Members $_.name -ErrorAction SilentlyContinue
           }
 
+EOF
+
+    cat > ansible/playbooks/04-post-reboot-sql.yml << 'EOF'
+---
+- name: Configure SQL Server (post-reboot)
+  hosts: dc
+  tasks:
     - name: Configure RDP access on SQL server
       ansible.windows.win_shell: |
         $domainCred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", (ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force))
-        
+
         Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $domainCred -Authentication Negotiate -ScriptBlock {
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "{{ domain_netbios_name }}\Remote Desktop Users" -ErrorAction SilentlyContinue
         }
       ignore_errors: yes
-      
-    - name: Configure SQL Server for domain authentication (simplified)
-      ansible.windows.win_shell: |
-        # Note: SQL Server domain authentication will be configured in a separate task
-        Write-Output "SQL Server is domain-joined. Configuring SQL authentication..."
-      ignore_errors: yes
-      
+
     - name: Configure SQL Server authentication and logins
       ansible.windows.win_shell: |
         $domainCred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", (ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force))
-        
+
         Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $domainCred -Authentication Negotiate -ScriptBlock {
           try {
             # First, restart SQL in single-user mode to ensure we have access
             Write-Output "Configuring SQL Server authentication..."
             Stop-Service MSSQLSERVER -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 5
-            
+
             # Start in single-user mode
             $sqlProcess = Start-Process -FilePath "net" -ArgumentList "start MSSQLSERVER /m" -Wait -PassThru -NoNewWindow
             Start-Sleep -Seconds 10
-            
+
             # Configure mixed mode and SA account using sqlcmd
             $sqlCommands = "USE [master]`nGO`nEXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'LoginMode', REG_DWORD, 2`nGO`nALTER LOGIN [sa] WITH PASSWORD = 'SAPassword123!'`nGO`nALTER LOGIN [sa] ENABLE`nGO`nEXIT"
-            
+
             $sqlCommands | sqlcmd -S localhost -E
-            
+
             # Restart SQL Server normally
             Stop-Service MSSQLSERVER -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 5
             Start-Service MSSQLSERVER
             Start-Sleep -Seconds 10
-            
+
             # Now add domain logins using SA account
             $domainCommands = "CREATE LOGIN [{{ domain_netbios_name }}\Domain Admins] FROM WINDOWS`nGO`nALTER SERVER ROLE sysadmin ADD MEMBER [{{ domain_netbios_name }}\Domain Admins]`nGO`nCREATE LOGIN [{{ domain_netbios_name }}\{{ ansible_user }}] FROM WINDOWS`nGO`nALTER SERVER ROLE sysadmin ADD MEMBER [{{ domain_netbios_name }}\{{ ansible_user }}]`nGO`nCREATE LOGIN [{{ domain_netbios_name }}\jsmith] FROM WINDOWS`nGO`nALTER SERVER ROLE sysadmin ADD MEMBER [{{ domain_netbios_name }}\jsmith]`nGO`nCREATE LOGIN [{{ domain_netbios_name }}\mjohnson] FROM WINDOWS`nGO`nCREATE LOGIN [{{ domain_netbios_name }}\bdavis] FROM WINDOWS`nGO`nSELECT name, type_desc FROM sys.server_principals WHERE type IN ('S', 'U', 'G') ORDER BY name`nGO`nEXIT"
-            
+
             $domainCommands | sqlcmd -S localhost -U sa -P "SAPassword123!"
-            
+
             Write-Output "SQL Server authentication configured successfully"
             Write-Output "SA password: SAPassword123!"
             Write-Output "Domain logins added for: Domain Admins, {{ ansible_user }}, jsmith, mjohnson, bdavis"
             Write-Output "SQL data and log files will use default C: drive locations"
-            
+
           } catch {
             Write-Output "Error configuring SQL Server: $_"
             Write-Output "You may need to configure SQL authentication manually"
@@ -1201,7 +1179,7 @@ EOF
         }
       register: sql_auth_config
       ignore_errors: yes
-      
+
     - name: Show SQL authentication configuration result
       debug:
         var: sql_auth_config.stdout_lines
@@ -2635,6 +2613,61 @@ EOF
 }
 
 # =============================================================================
+# Finalize SQL01: single reboot + post-reboot configuration
+# Reboots SQL01 once to apply domain join (and RDS roles if --with-rds).
+# Then runs domain-auth-dependent tasks (RDP access, SQL logins).
+# =============================================================================
+reboot_sql_server() {
+    print_status "Rebooting SQL server to finalize domain join..."
+
+    cd "$PROJECT_DIR"
+    source "$CONFIG_FILE"
+
+    # Reboot SQL01 via Ansible (through DC proxy)
+    pushd "$PROJECT_DIR/ansible" > /dev/null
+    source "$HOME/.venvs/ansible/bin/activate"
+
+    ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
+        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $localCred = New-Object PSCredential("{{ ansible_user }}", $password); $sessionOption = New-PSSessionOption -SkipCACheck -SkipCNCheck; Invoke-Command -ComputerName 10.0.2.10 -Credential $localCred -Authentication Basic -SessionOption $sessionOption -ScriptBlock { shutdown /r /t 5 /c "Finalizing domain join" }' \
+        -e @group_vars/windows.yml 2>&1 || true
+
+    print_status "Waiting for SQL server to reboot (45 seconds initial pause)..."
+    sleep 45
+
+    print_status "Polling for SQL server to come back online (max 5 min)..."
+    local max_attempts=30
+    local attempt=1
+    while [ $attempt -le $max_attempts ]; do
+        if ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
+            -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Test-WSMan -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication Negotiate -ErrorAction Stop' \
+            -e @group_vars/windows.yml &>/dev/null; then
+            print_status "SQL server is back online with domain authentication"
+            break
+        fi
+        print_warning "Waiting for SQL server... (attempt $attempt/$max_attempts)"
+        sleep 10
+        ((attempt++))
+    done
+
+    if [ $attempt -gt $max_attempts ]; then
+        print_error "SQL server did not come back online after reboot"
+        exit 1
+    fi
+
+    print_status "Waiting for services to stabilize (30 seconds)..."
+    sleep 30
+
+    # Run post-reboot SQL configuration
+    print_status "Running post-reboot SQL configuration (RDP access, SQL logins)..."
+    ansible-playbook playbooks/04-post-reboot-sql.yml -e @group_vars/windows.yml
+
+    deactivate
+    popd > /dev/null
+
+    print_status "SQL server finalization complete"
+}
+
+# =============================================================================
 # Phase 4: RDS Deployment (optional — activated with --with-rds flag)
 # Extends SQL01 with Remote Desktop Services and publishes SSMS as a RemoteApp.
 # Run after the main three-phase deployment completes.
@@ -2724,16 +2757,23 @@ install_ssms() {
     cd "$PROJECT_DIR"
 }
 
-# Phase 4 — Step 3: Install RDS roles on SQL01 (triggers reboot if required)
+# Phase 4 — Step 3: Install RDS roles on SQL01 (reboot deferred to end)
 install_rds_roles() {
     print_status "Installing RDS roles on SQL server..."
 
-    cd "$PROJECT_DIR/ansible"
+    cd "$PROJECT_DIR"
+
+    # Check if already installed (via Azure VM Run Command — SQL01 may not have domain auth yet)
+    local rds_check_output
+    rds_check_output=$(az vm run-command invoke \
+        --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+        --name "vm-sql-$ENVIRONMENT" \
+        --command-id RunPowerShellScript \
+        --scripts 'if ((Get-WindowsFeature -Name RDS-RD-Server).InstallState -eq "Installed") { "installed" } else { "not-installed" }' \
+        --output json 2>&1)
 
     local rds_check
-    rds_check=$(ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -ScriptBlock { if ((Get-WindowsFeature -Name RDS-RD-Server).InstallState -eq "Installed") { "installed" } else { "not-installed" } }' \
-        -e @group_vars/windows.yml 2>/dev/null | grep -o "installed\|not-installed" | tail -1)
+    rds_check=$(echo "$rds_check_output" | jq -r '.value[0].message // ""' | grep -o "installed\|not-installed" | tail -1)
 
     if [ "$rds_check" = "installed" ]; then
         print_status "RDS roles already installed, skipping..."
@@ -2753,41 +2793,9 @@ install_rds_roles() {
         echo "$rds_msg"
 
         if echo "$rds_msg" | grep -q "RestartNeeded=Yes" || echo "$rds_msg" | grep -q "RestartNeeded=True"; then
-            print_status "Reboot required after RDS installation. Rebooting SQL server..."
-            az vm run-command invoke \
-                --resource-group "rg-beyondtrust-$ENVIRONMENT" \
-                --name "vm-sql-$ENVIRONMENT" \
-                --command-id RunPowerShellScript \
-                --scripts 'Restart-Computer -Force' \
-                --output json 2>&1 || true
-
-            print_status "Waiting for SQL server to reboot (30 seconds initial pause)..."
-            sleep 30
-
-            print_status "Polling for SQL server to come back online (max 5 min)..."
-            local max_attempts=30
-            local attempt=1
-            while [ $attempt -le $max_attempts ]; do
-                if ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-                    -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Test-WSMan -ComputerName SQL01.{{ domain_name }} -ErrorAction SilentlyContinue' \
-                    -e @group_vars/windows.yml &>/dev/null; then
-                    print_status "SQL server is back online"
-                    break
-                fi
-                print_warning "Waiting for SQL server... (attempt $attempt/$max_attempts)"
-                sleep 10
-                ((attempt++))
-            done
-
-            if [ $attempt -gt $max_attempts ]; then
-                print_error "SQL server did not come back online after reboot"
-                exit 1
-            fi
-
-            print_status "Waiting for services to stabilize (30 seconds)..."
-            sleep 30
+            print_status "RDS roles installed — reboot needed (will be handled by the consolidated SQL01 reboot)"
         else
-            print_status "No reboot required after RDS installation"
+            print_status "RDS roles installed — no reboot required"
         fi
     fi
 
@@ -3011,11 +3019,14 @@ JSON
     print_status "Full desktop jump item for SQL01 already created by Phase 3, skipping..."
 }
 
-# Phase 4 orchestrator — called from main() when --with-rds is passed
-deploy_rds() {
+# Phase 4 orchestrator — split into pre-reboot and post-reboot halves.
+# Pre-reboot steps run BEFORE the consolidated SQL01 reboot (no domain auth needed).
+# Post-reboot steps run AFTER the reboot (require domain auth on SQL01).
+
+deploy_rds_pre_reboot() {
     echo ""
     echo "=================================================="
-    echo "Phase 4: RDS Deployment"
+    echo "Phase 4 (pre-reboot): RDS Deployment"
     echo "=================================================="
 
     print_status "Step 4.1: Installing Chocolatey"
@@ -3026,9 +3037,18 @@ deploy_rds() {
     install_ssms
     echo ""
 
-    print_status "Step 4.3: Installing RDS roles"
+    print_status "Step 4.3: Installing RDS roles (reboot deferred)"
     install_rds_roles
     echo ""
+
+    print_status "Phase 4 pre-reboot steps complete — RDS roles will activate after SQL01 reboot"
+}
+
+deploy_rds_post_reboot() {
+    echo ""
+    echo "=================================================="
+    echo "Phase 4 (post-reboot): RDS Configuration"
+    echo "=================================================="
 
     print_status "Step 4.4: Configuring CredSSP (DC→SQL01 proxy for RDS cmdlets)"
     configure_credssp_for_rds
@@ -3193,15 +3213,24 @@ main() {
     # Phase 1: Deploy Azure Infrastructure
     deploy_azure_infrastructure
     
-    # Phase 2: Configure Domain
+    # Phase 2: Configure Domain (DC reboots once during promotion; SQL01 domain join deferred)
     configure_domain
-    
+
     # Phase 3: Deploy BeyondTrust
     deploy_beyondtrust
 
-    # Phase 4: RDS Deployment (optional — pass --with-rds to activate)
+    # Phase 4 pre-reboot: install RDS prerequisites before SQL01 reboot (optional)
     if [ "$WITH_RDS" = true ]; then
-        deploy_rds
+        deploy_rds_pre_reboot
+    fi
+
+    # Finalize SQL01: single reboot to apply domain join (+ RDS roles if applicable),
+    # then run post-reboot SQL configuration (RDP access, SQL logins)
+    reboot_sql_server
+
+    # Phase 4 post-reboot: configure RDS services that need domain auth (optional)
+    if [ "$WITH_RDS" = true ]; then
+        deploy_rds_post_reboot
     fi
 
     # Get values from state file for summary
