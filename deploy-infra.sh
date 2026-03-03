@@ -1382,8 +1382,12 @@ fi
 echo \"Found installer: \$INSTALLER\"
 chmod +x \"\$INSTALLER\"
 echo 'Installing Jump Client...'
-KEY_INFO='${bt_key_info}' \"\$INSTALLER\" --headless --startup systemd --install-dir /opt/beyondtrust/jumpclient
-echo 'Jump Client installation complete'"
+\"\$INSTALLER\" --key-info '${bt_key_info}' --headless --scope system --startup systemd --install-dir /opt/beyondtrust/jumpclient
+echo 'Jump Client installation complete'
+echo 'Checking service status...'
+sleep 5
+systemctl list-units --type=service --no-legend | grep -iE 'scc|bomgar|beyond' || echo 'WARNING: no BeyondTrust service unit found'
+systemctl list-units --type=service --state=active --no-legend | grep -iE 'scc|bomgar|beyond' && echo 'Service is active' || echo 'WARNING: service not active yet'"
 
             local run_result
             run_result=$(az vm run-command invoke \
