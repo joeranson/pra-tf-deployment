@@ -196,6 +196,17 @@ VAULT_ACCOUNT_GROUP_ID="4"
 # DEMO_USER_1="jsmith:John:Smith:DemoPass123!"
 # DEMO_USER_2="mjohnson:Mary:Johnson:DemoPass123!"
 # DEMO_USER_3="bdavis:Bob:Davis:DemoPass123!"
+
+#===========================================
+# LINUX VM CONFIGURATION
+#===========================================
+
+# Credentials for the Ubuntu Linux VM local admin account
+LINUX_ADMIN_USERNAME="linuxadmin"
+LINUX_ADMIN_PASSWORD="UbuntuPass123!"
+
+# Optional: Override default Linux BeyondTrust Jump Group name
+# JUMP_GROUP_LINUX="Linux Servers"
 EOF
         
         print_warning "Configuration file created at: $CONFIG_FILE"
@@ -224,11 +235,15 @@ validate_config() {
     JUMP_GROUP_DC="${RESOURCE_PREFIX}${JUMP_GROUP_DC:-Domain Controllers}"
     JUMPOINT_NAME="${RESOURCE_PREFIX}${JUMPOINT_NAME:-DC01_Jumpoint}"
     VAULT_ACCOUNT_GROUP_ID="${VAULT_ACCOUNT_GROUP_ID:-4}"
+    LINUX_ADMIN_USERNAME="${LINUX_ADMIN_USERNAME:-linuxadmin}"
+    LINUX_ADMIN_PASSWORD="${LINUX_ADMIN_PASSWORD:-UbuntuPass123!}"
+    JUMP_GROUP_LINUX="${RESOURCE_PREFIX}${JUMP_GROUP_LINUX:-Linux Servers}"
 
     # EXPORT ALL VARIABLES (FIX)
     export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET APPROVER_EMAIL RESOURCE_PREFIX
     export DOMAIN_NAME DOMAIN_NETBIOS_NAME ADMIN_USERNAME ADMIN_PASSWORD
     export JUMP_GROUP_DEMO JUMP_GROUP_DC JUMPOINT_NAME VAULT_ACCOUNT_GROUP_ID
+    export LINUX_ADMIN_USERNAME LINUX_ADMIN_PASSWORD JUMP_GROUP_LINUX
     
     print_status "Configuration validated successfully"
 }
@@ -373,6 +388,19 @@ variable "allowed_rdp_source_ip" {
   description = "CIDR of the deployer's public IP for RDP/WinRM access (e.g. 203.0.113.1/32)"
 }
 
+variable "linux_admin_username" {
+  type        = string
+  description = "Administrator username for the Ubuntu Linux VM"
+  default     = "linuxadmin"
+}
+
+variable "linux_admin_password" {
+  type        = string
+  description = "Administrator password for the Ubuntu Linux VM"
+  sensitive   = true
+  default     = "UbuntuPass123!"
+}
+
 # Resource Group
 resource "azurerm_resource_group" "demo" {
   name     = "rg-beyondtrust-${var.environment}"
@@ -403,6 +431,13 @@ resource "azurerm_subnet" "sql" {
   resource_group_name  = azurerm_resource_group.demo.name
   virtual_network_name = azurerm_virtual_network.demo.name
   address_prefixes     = ["10.0.2.0/24"]
+}
+
+resource "azurerm_subnet" "linux" {
+  name                 = "subnet-linux"
+  resource_group_name  = azurerm_resource_group.demo.name
+  virtual_network_name = azurerm_virtual_network.demo.name
+  address_prefixes     = ["10.0.3.0/24"]
 }
 
 # NSG for DC
@@ -501,9 +536,53 @@ resource "azurerm_subnet_network_security_group_association" "sql" {
   network_security_group_id = azurerm_network_security_group.sql.id
 }
 
+# NSG for Linux
+resource "azurerm_network_security_group" "linux" {
+  name                = "nsg-linux-${var.environment}"
+  location            = azurerm_resource_group.demo.location
+  resource_group_name = azurerm_resource_group.demo.name
+
+  security_rule {
+    name                       = "SSH-VNet"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "22"
+    source_address_prefix      = "10.0.0.0/16"
+    destination_address_prefix = "*"
+  }
+
+  security_rule {
+    name                       = "SSH-Deployer"
+    priority                   = 101
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "22"
+    source_address_prefix      = var.allowed_rdp_source_ip
+    destination_address_prefix = "*"
+  }
+}
+
+resource "azurerm_subnet_network_security_group_association" "linux" {
+  subnet_id                 = azurerm_subnet.linux.id
+  network_security_group_id = azurerm_network_security_group.linux.id
+}
+
 # Public IP for DC
 resource "azurerm_public_ip" "dc" {
   name                = "pip-dc-${var.environment}"
+  resource_group_name = azurerm_resource_group.demo.name
+  location            = azurerm_resource_group.demo.location
+  allocation_method   = "Static"
+  sku                 = "Standard"
+}
+
+resource "azurerm_public_ip" "ubuntu" {
+  name                = "pip-ubuntu-${var.environment}"
   resource_group_name = azurerm_resource_group.demo.name
   location            = azurerm_resource_group.demo.location
   allocation_method   = "Static"
@@ -538,6 +617,20 @@ resource "azurerm_network_interface" "sql" {
   }
 
   dns_servers = ["10.0.1.10"]
+}
+
+resource "azurerm_network_interface" "ubuntu" {
+  name                = "nic-ubuntu-${var.environment}"
+  location            = azurerm_resource_group.demo.location
+  resource_group_name = azurerm_resource_group.demo.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.linux.id
+    private_ip_address_allocation = "Static"
+    private_ip_address            = "10.0.3.10"
+    public_ip_address_id          = azurerm_public_ip.ubuntu.id
+  }
 }
 
 # VMs
@@ -620,6 +713,39 @@ resource "azurerm_mssql_virtual_machine" "sql" {
   # depends_on is implicit via virtual_machine_id reference; no explicit declaration needed
 }
 
+# Ubuntu Linux VM
+resource "azurerm_linux_virtual_machine" "ubuntu" {
+  name                            = "vm-ubuntu-${var.environment}"
+  computer_name                   = "UBUNTU01"
+  resource_group_name             = azurerm_resource_group.demo.name
+  location                        = azurerm_resource_group.demo.location
+  size                            = "Standard_B2s"
+  admin_username                  = var.linux_admin_username
+  admin_password                  = var.linux_admin_password
+  disable_password_authentication = false
+
+  network_interface_ids = [azurerm_network_interface.ubuntu.id]
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "ubuntu-24_04-lts"
+    sku       = "server"
+    version   = "latest"
+  }
+
+  tags = {
+    Environment = var.environment
+    Project     = "BeyondTrust-Demo"
+    ManagedBy   = "Terraform"
+    Role        = "LinuxServer"
+  }
+}
+
 locals {
   winrm_script = <<-EOT
     Enable-PSRemoting -Force
@@ -673,6 +799,10 @@ output "dc_public_ip" {
   value = azurerm_public_ip.dc.ip_address
 }
 
+output "ubuntu_public_ip" {
+  value = azurerm_public_ip.ubuntu.ip_address
+}
+
 output "deployment_info" {
   sensitive = true
   value = {
@@ -689,6 +819,8 @@ azure_region          = "$AZURE_REGION"
 admin_username        = "$ADMIN_USERNAME"
 admin_password        = "$ADMIN_PASSWORD"
 allowed_rdp_source_ip = "$MY_PUBLIC_IP/32"
+linux_admin_username  = "$LINUX_ADMIN_USERNAME"
+linux_admin_password  = "$LINUX_ADMIN_PASSWORD"
 EOF
 
     # Set Azure subscription
@@ -780,6 +912,21 @@ all:
           ansible_host: $DC_IP
         sql:
           ansible_host: 10.0.2.10
+    linux:
+      vars:
+        ansible_connection: ssh
+        ansible_shell_type: sh
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o ProxyJump=$ADMIN_USERNAME@$DC_IP'
+      hosts:
+        ubuntu:
+          ansible_host: 10.0.3.10
+          ansible_connection: ssh
+          ansible_port: 22
+          ansible_user: $LINUX_ADMIN_USERNAME
+          ansible_password: "$LINUX_ADMIN_PASSWORD"
+          ansible_become: yes
+          ansible_become_method: sudo
+          ansible_become_pass: "$LINUX_ADMIN_PASSWORD"
 EOF
 
     # Create playbooks
@@ -1158,10 +1305,12 @@ deploy_beyondtrust() {
     terraform output -raw jump_group_demo_id > demo_group_id.txt
     terraform output -raw jump_group_dc_id > dc_group_id.txt
     terraform output -raw jumpoint_id > jumpoint_id.txt
+    terraform output -raw jump_group_linux_id > linux_group_id.txt
 
     # Track Terraform resources in state
     add_resource "jump_group" "$(cat demo_group_id.txt)" "$JUMP_GROUP_DEMO" '{"type": "shared", "managed_by": "terraform"}'
     add_resource "jump_group" "$(cat dc_group_id.txt)" "$JUMP_GROUP_DC" '{"type": "shared", "managed_by": "terraform"}'
+    add_resource "jump_group" "$(cat linux_group_id.txt)" "$JUMP_GROUP_LINUX" '{"type": "shared", "managed_by": "terraform"}'
     add_resource "jumpoint" "$(cat jumpoint_id.txt)" "$JUMPOINT_NAME" '{"platform": "windows-x86", "managed_by": "terraform"}'
     popd > /dev/null
 
@@ -1194,6 +1343,83 @@ deploy_beyondtrust() {
         deactivate
     fi
     popd > /dev/null
+
+    # Step 4b: Install Jump Client on Ubuntu directly via Azure VM run-command
+    # (bypasses Ansible entirely — avoids WinRM/SSH connection plugin conflicts)
+    print_status "Installing BeyondTrust Jump Client on Ubuntu via Azure run-command..."
+    local downloads_dir="$PROJECT_DIR/beyondtrust/downloads"
+    local key_info_file="$downloads_dir/jumpclient-linux-keyinfo.txt"
+    local installer_id_file="$downloads_dir/jumpclient-linux-installer-id.txt"
+
+    if [ -f "$key_info_file" ] && [ -f "$installer_id_file" ]; then
+        local bt_key_info
+        bt_key_info=$(cat "$key_info_file")
+        local bt_installer_id
+        bt_installer_id=$(cat "$installer_id_file")
+
+        # Get a fresh BeyondTrust API token for the VM to download the installer
+        local bt_token
+        bt_token=$(curl -s -X POST "${BT_API_HOST}/oauth2/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials&client_id=${BT_CLIENT_ID}&client_secret=${BT_CLIENT_SECRET}" \
+            | jq -r '.access_token // empty')
+
+        if [ -z "$bt_token" ]; then
+            print_warning "Failed to get BeyondTrust API token — skipping Ubuntu Jump Client installation"
+        else
+            local ubuntu_script
+            ubuntu_script="echo 'Downloading Jump Client installer from BeyondTrust...'
+touch /tmp/jc_before
+cd /tmp
+curl -sf -J -O -H 'Authorization: Bearer ${bt_token}' '${BT_API_HOST}/api/config/v1/jump-client/installer/${bt_installer_id}/linux-64'
+INSTALLER=\$(find /tmp -maxdepth 1 -newer /tmp/jc_before -type f 2>/dev/null | head -1)
+rm -f /tmp/jc_before
+if [ -z \"\$INSTALLER\" ]; then
+  echo 'ERROR: installer not found after download'
+  ls -la /tmp/
+  exit 1
+fi
+echo \"Found installer: \$INSTALLER\"
+chmod +x \"\$INSTALLER\"
+echo 'Installing Jump Client...'
+\"\$INSTALLER\" --key-info '${bt_key_info}' --headless --scope system --startup systemd --install-dir /opt/beyondtrust/jumpclient --session-user linuxadmin
+INSTALL_RC=\$?
+echo \"Installer exit code: \$INSTALL_RC\"
+if [ \$INSTALL_RC -ne 0 ]; then
+  echo 'ERROR: Jump Client installation failed with exit code '\$INSTALL_RC
+  exit 1
+fi
+echo 'Jump Client installation complete'
+echo 'Checking service status...'
+sleep 10
+systemctl list-units --type=service --no-legend | grep -iE 'scc|bomgar|beyond' || echo 'WARNING: no BeyondTrust service unit found'
+systemctl list-units --type=service --state=active --no-legend | grep -iE 'scc|bomgar|beyond' && echo 'Service is active' || echo 'WARNING: service not active yet'
+echo 'Recent service journal (last 30 lines):'
+journalctl --no-pager -n 30 2>/dev/null | grep -iE 'scc|bomgar|beyond|jumpclient' || echo 'No relevant journal entries found'"
+
+            local run_result
+            run_result=$(az vm run-command invoke \
+                --resource-group "rg-beyondtrust-${ENVIRONMENT}" \
+                --name "vm-ubuntu-${ENVIRONMENT}" \
+                --command-id RunShellScript \
+                --scripts "$ubuntu_script" \
+                --output json 2>&1)
+
+            local az_exit=$?
+            if [ $az_exit -eq 0 ]; then
+                local stdout
+                stdout=$(echo "$run_result" | jq -r '.value[0].message // "completed"' 2>/dev/null)
+                print_status "Ubuntu Jump Client installation output:"
+                echo "$stdout"
+            else
+                print_warning "Azure run-command for Ubuntu returned non-zero exit ($az_exit). Output:"
+                echo "$run_result" | head -20
+            fi
+        fi
+    else
+        print_warning "Linux Jump Client download files not found — skipping Ubuntu installation"
+        print_warning "  Missing: ${key_info_file} or ${installer_id_file}"
+    fi
 
     # Step 5: Configure jump items (using wrapper)
     print_status "Configuring jump items..."
@@ -1279,6 +1505,12 @@ resource "sra_jump_group" "domain_controllers" {
   comments  = "Domain controllers with direct access"
 }
 
+resource "sra_jump_group" "linux_servers" {
+  name      = "$JUMP_GROUP_LINUX"
+  code_name = "linux_servers"
+  comments  = "Linux servers accessible via SSH Shell Jump"
+}
+
 # Jumpoint
 resource "sra_jumpoint" "dc_jumpoint" {
   name                    = "$JUMPOINT_NAME"
@@ -1301,6 +1533,10 @@ output "jump_group_dc_id" {
 
 output "jumpoint_id" {
   value = sra_jumpoint.dc_jumpoint.id
+}
+
+output "jump_group_linux_id" {
+  value = sra_jump_group.linux_servers.id
 }
 EOF
 }
@@ -1647,6 +1883,96 @@ JSON
     cd - > /dev/null
 }
 
+# Create and download Linux Jump Client installer (.sh shell script, linux64-x86)
+create_linux_jump_client() {
+    echo "Creating Linux Jump Client installer..."
+
+    local linux_group_id=$(cat ../terraform/linux_group_id.txt)
+
+    local installer_data=$(cat <<JSON
+{
+    "name": "${RESOURCE_PREFIX}Ubuntu01_JumpClient",
+    "jump_group_id": $linux_group_id,
+    "jump_group_type": "shared",
+    "tag": "linux-server",
+    "comments": "Jump Client for Ubuntu Linux server",
+    "connection_type": "active",
+    "valid_duration": 1440,
+    "elevate_install": false,
+    "elevate_prompt": false
+}
+JSON
+)
+
+    local response=$(api_call "POST" "/jump-client/installer" "$installer_data")
+
+    echo "$response" > ../downloads/jumpclient-linux-response.json
+
+    local installer_id=$(echo "$response" | jq -r .installer_id)
+
+    if [ -z "$installer_id" ] || [ "$installer_id" = "null" ]; then
+        echo "ERROR: Failed to create Linux Jump Client installer"
+        echo "Response: $response"
+        return 1
+    fi
+
+    echo "Created Linux installer with ID: $installer_id"
+    echo "$installer_id" > ../downloads/jumpclient-linux-installer-id.txt
+
+    # Track installer creation (same resource type as Windows — cleanup handles both)
+    add_bt_resource "jump_client_installer" "$installer_id" "${RESOURCE_PREFIX}Ubuntu01_JumpClient" '{"type": "sh", "platform": "linux64-x86"}'
+
+    # Extract key_info for Linux 64-bit x86 shell script installer
+    local key_info=$(echo "$response" | jq -r '
+        .key_info."linux64-x86".encodedInfo //
+        empty')
+    if [ -n "$key_info" ]; then
+        echo "$key_info" > ../downloads/jumpclient-linux-keyinfo.txt
+        echo "Key info extracted for Linux 64-bit installer"
+    else
+        echo "ERROR: No key info found for linux64-x86 platform"
+        echo "Available platforms: $(echo "$response" | jq -r '.key_info | keys[]' 2>/dev/null)"
+        return 1
+    fi
+
+    # Download the linux-64 .bin installer (API path param is 'linux-64', key_info key is 'linux64-x86')
+    local platform="linux-64"
+    echo "Downloading Linux Jump Client installer (${platform})..."
+    local token=$(get_api_token)
+
+    cd ../downloads
+
+    local filename="jumpclient-linux.bin"
+    local http_code
+    http_code=$(curl -s -o "$filename" -w "%{http_code}" -H "Authorization: Bearer $token" \
+        "$BT_API_HOST/api/config/v1/jump-client/installer/$installer_id/${platform}")
+    if [ "$http_code" != "200" ]; then
+        echo "ERROR: Download failed with HTTP $http_code"
+        rm -f "$filename"
+        cd - > /dev/null
+        return 1
+    fi
+
+    if [ -f "$filename" ]; then
+        local filesize=$(stat -c%s "$filename" 2>/dev/null || stat -f%z "$filename" 2>/dev/null)
+        if [ "$filesize" -lt 1000000 ]; then
+            echo "ERROR: Linux Jump Client installer too small ($filesize bytes), likely an error response"
+            cat "$filename" | head -n 5
+            rm -f "$filename"
+            cd - > /dev/null
+            return 1
+        fi
+        echo "$filename" > jumpclient-linux-filename.txt
+        echo "Linux Jump Client installer downloaded: $filename ($(($filesize / 1024 / 1024)) MB)"
+    else
+        echo "ERROR: Failed to download Linux Jump Client installer"
+        cd - > /dev/null
+        return 1
+    fi
+
+    cd - > /dev/null
+}
+
 # Main execution
 download_jumpoint
 if [ $? -ne 0 ]; then
@@ -1657,6 +1983,12 @@ fi
 create_jump_client
 if [ $? -ne 0 ]; then
     echo "ERROR: Jump Client download failed"
+    exit 1
+fi
+
+create_linux_jump_client
+if [ $? -ne 0 ]; then
+    echo "ERROR: Linux Jump Client download failed"
     exit 1
 fi
 
@@ -1682,9 +2014,11 @@ DEMO_GROUP_ID=$(cat ../terraform/demo_group_id.txt)
 DC_GROUP_ID=$(cat ../terraform/dc_group_id.txt)
 APPROVAL_POLICY_ID=$(cat ../config/approval_policy.json | jq -r .id)
 DIRECT_POLICY_ID=$(cat ../config/direct_policy.json | jq -r .id)
+LINUX_GROUP_ID=$(cat ../terraform/linux_group_id.txt)
 
-# Define SQL Server IP
+# Define server IPs
 SQL_PRIVATE_IP="10.0.2.10"
+UBUNTU_PRIVATE_IP="10.0.3.10"
 
 # Create RDP Jump Item for SQL Server
 create_sql_jump_item() {
@@ -1831,11 +2165,47 @@ JSON
     fi
 }
 
+# Create SSH Shell Jump Item for Ubuntu via Jumpoint
+create_ubuntu_shell_jump_item() {
+    echo "Creating SSH Shell Jump Item for Ubuntu Linux server..."
+
+    local jump_item_data=$(cat <<JSON
+{
+    "name": "${RESOURCE_PREFIX}Ubuntu01 - SSH",
+    "hostname": "$UBUNTU_PRIVATE_IP",
+    "port": 22,
+    "protocol": "ssh",
+    "jumpoint_id": $JUMPOINT_ID,
+    "jump_group_id": $LINUX_GROUP_ID,
+    "jump_group_type": "shared",
+    "username": "linuxadmin",
+    "terminal": "xterm",
+    "jump_policy_id": $APPROVAL_POLICY_ID,
+    "tag": "linux-server",
+    "comments": "Ubuntu Linux server via SSH Shell Jump"
+}
+JSON
+)
+
+    local response=$(api_call "POST" "/jump-item/shell-jump" "$jump_item_data")
+
+    local item_id=$(echo "$response" | jq -r '.id')
+    local item_name=$(echo "$response" | jq -r '.name')
+    if [ -n "$item_id" ] && [ "$item_id" != "null" ]; then
+        add_bt_resource "jump_item_shell" "$item_id" "$item_name" "{\"hostname\": \"$UBUNTU_PRIVATE_IP\", \"type\": \"shell_jump\"}"
+        echo "  Created shell jump item ID: $item_id"
+    else
+        echo "  ERROR: Failed to create Ubuntu shell jump item"
+        echo "  Response: $response"
+    fi
+}
+
 # Main execution
 create_sql_jump_item
 create_sql_web_jump_item
 create_dc_jump_item
 create_mssql_tunnel_item
+create_ubuntu_shell_jump_item
 
 echo "Jump items configured successfully"
 EOF
@@ -1905,10 +2275,11 @@ create_vault_account "Domain Admin" "${DOMAIN_NETBIOS_NAME}\\${ADMIN_USERNAME}" 
 create_vault_account "Demo User - John Smith" "${DOMAIN_NETBIOS_NAME}\\jsmith" "DemoPass123!"
 create_vault_account "Demo User - Mary Johnson" "${DOMAIN_NETBIOS_NAME}\\mjohnson" "DemoPass123!"
 create_vault_account "Demo User - Bob Davis" "${DOMAIN_NETBIOS_NAME}\\bdavis" "DemoPass123!"
+create_vault_account "Ubuntu Linux Admin" "linuxadmin" "$LINUX_ADMIN_PASSWORD"
 
 echo "Vault accounts created successfully"
 EOF
-    
+
     chmod +x beyondtrust/scripts/configure-vault.sh
 }
 
@@ -1951,6 +2322,32 @@ cleanup_jump_items() {
     else
         echo "  No MSSQL tunnel jump items found in state file"
     fi
+
+    # Clean up Shell Jump items (Linux/Ubuntu)
+    local shell_item_ids=$(get_bt_resources "jump_item_shell")
+    if [ -n "$shell_item_ids" ]; then
+        echo "$shell_item_ids" | while read -r item_id; do
+            if [ -n "$item_id" ]; then
+                echo "  Deleting shell jump item: $item_id"
+                api_call "DELETE" "/jump-item/shell-jump/$item_id" "" || echo "    Failed to delete shell jump item $item_id"
+            fi
+        done
+    else
+        echo "  No shell jump items found in state file"
+    fi
+
+    # Clean up Web Jump items
+    local web_item_ids=$(get_bt_resources "jump_item_web")
+    if [ -n "$web_item_ids" ]; then
+        echo "$web_item_ids" | while read -r item_id; do
+            if [ -n "$item_id" ]; then
+                echo "  Deleting web jump item: $item_id"
+                api_call "DELETE" "/jump-item/web-jump/$item_id" "" || echo "    Failed to delete web jump item $item_id"
+            fi
+        done
+    else
+        echo "  No web jump items found in state file"
+    fi
 }
 
 # Delete Vault Accounts
@@ -1992,9 +2389,14 @@ cleanup_jump_client_installers() {
     local clients=$(api_call "GET" "/jump-client" "")
     
     if [ -n "$clients" ]; then
-        # Look for our specific jump client by matching the name
+        # Look for our specific jump clients by matching the name
         echo "$clients" | jq -r --arg prefix "$RESOURCE_PREFIX" \
-            '.[] | select(.name == ($prefix + "DC01_JumpClient") or .comments == "Jump Client for Domain Controller") | .id' | \
+            '.[] | select(
+                .name == ($prefix + "DC01_JumpClient") or
+                .name == ($prefix + "Ubuntu01_JumpClient") or
+                .comments == "Jump Client for Domain Controller" or
+                .comments == "Jump Client for Ubuntu Linux server"
+            ) | .id' | \
         while read -r client_id; do
             if [ -n "$client_id" ]; then
                 echo "  Deleting jump client: $client_id"
@@ -2817,14 +3219,17 @@ main() {
     echo ""
     echo "BeyondTrust Resources:"
     echo "  Instance: $BT_API_HOST"
-    echo "  Jump Groups: $JUMP_GROUP_DEMO, $JUMP_GROUP_DC"
+    echo "  Jump Groups: $JUMP_GROUP_DEMO, $JUMP_GROUP_DC, $JUMP_GROUP_LINUX"
     echo "  Jumpoint: $JUMPOINT_NAME on DC01"
-    echo "  Jump Items: RDP access to DC01 and SQL01, MSSQL tunnel to SQL01"
-    echo "  Vault Accounts: $DOMAIN_NETBIOS_NAME\\testadmin, $DOMAIN_NETBIOS_NAME\\jsmith, $DOMAIN_NETBIOS_NAME\\mjohnson, $DOMAIN_NETBIOS_NAME\\bdavis"
+    echo "  Jump Items: RDP access to DC01 and SQL01, MSSQL tunnel to SQL01, SSH Shell Jump to Ubuntu01"
+    echo "  Vault Accounts (Windows): $DOMAIN_NETBIOS_NAME\\testadmin, $DOMAIN_NETBIOS_NAME\\jsmith, $DOMAIN_NETBIOS_NAME\\mjohnson, $DOMAIN_NETBIOS_NAME\\bdavis"
+    echo "  Vault Accounts (Linux): linuxadmin (local Ubuntu account)"
     echo ""
     echo "Access Patterns:"
     echo "  Direct to DC01: Console → Jump Clients → DC01-JumpClient"
     echo "  Approved to SQL01: Console → Jump Items → SQL01 → Request approval"
+    echo "  SSH to Ubuntu01 via Jumpoint: Console → Jump Items → Linux Servers → Ubuntu01 - SSH"
+    echo "  Ubuntu01 Jump Client: Console → Jump → Linux Servers → Ubuntu01_JumpClient"
     echo "  Approver: $APPROVER_EMAIL"
     echo ""
     echo "Demo Users (all have RDP access):"
