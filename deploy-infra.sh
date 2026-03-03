@@ -1381,13 +1381,25 @@ if [ -z \"\$INSTALLER\" ]; then
 fi
 echo \"Found installer: \$INSTALLER\"
 chmod +x \"\$INSTALLER\"
+if [ -d /opt/beyondtrust/jumpclient ]; then
+  echo 'Removing previous installation directory...'
+  rm -rf /opt/beyondtrust/jumpclient
+fi
 echo 'Installing Jump Client...'
-\"\$INSTALLER\" --key-info '${bt_key_info}' --headless --scope system --startup systemd --install-dir /opt/beyondtrust/jumpclient
+\"\$INSTALLER\" --key-info '${bt_key_info}' --headless --scope system --startup systemd --install-dir /opt/beyondtrust/jumpclient --session-user linuxadmin
+INSTALL_RC=\$?
+echo \"Installer exit code: \$INSTALL_RC\"
+if [ \$INSTALL_RC -ne 0 ]; then
+  echo 'ERROR: Jump Client installation failed with exit code '\$INSTALL_RC
+  exit 1
+fi
 echo 'Jump Client installation complete'
 echo 'Checking service status...'
-sleep 5
+sleep 10
 systemctl list-units --type=service --no-legend | grep -iE 'scc|bomgar|beyond' || echo 'WARNING: no BeyondTrust service unit found'
-systemctl list-units --type=service --state=active --no-legend | grep -iE 'scc|bomgar|beyond' && echo 'Service is active' || echo 'WARNING: service not active yet'"
+systemctl list-units --type=service --state=active --no-legend | grep -iE 'scc|bomgar|beyond' && echo 'Service is active' || echo 'WARNING: service not active yet'
+echo 'Recent service journal (last 30 lines):'
+journalctl --no-pager -n 30 2>/dev/null | grep -iE 'scc|bomgar|beyond|jumpclient' || echo 'No relevant journal entries found'"
 
             local run_result
             run_result=$(az vm run-command invoke \
