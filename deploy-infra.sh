@@ -1141,6 +1141,15 @@ EOF
 - name: Configure SQL Server (post-reboot)
   hosts: dc
   tasks:
+    - name: Wait for SQL01 WinRM to be fully ready for remote sessions
+      ansible.windows.win_shell: |
+        $domainCred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", (ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force))
+        Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $domainCred -Authentication Negotiate -ScriptBlock { hostname }
+      register: sql_winrm_check
+      retries: 12
+      delay: 10
+      until: sql_winrm_check.rc == 0
+
     - name: Configure RDP access on SQL server
       ansible.windows.win_shell: |
         $domainCred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", (ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force))
