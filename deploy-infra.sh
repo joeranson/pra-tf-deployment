@@ -1365,92 +1365,18 @@ install_beyondtrust_software() {
 
     local downloads_dir="$PROJECT_DIR/beyondtrust/downloads"
 
-    # --- DC01 installation via Azure VM run-command (replaces slow win_copy) ---
+    # --- DC01 installation via Ansible playbook (win_copy + win_shell) ---
     _install_bt_on_dc01() {
-        echo "[$(date '+%H:%M:%S')] DC01-INSTALL: Starting..."
-
-        local jumpoint_id=$(cat "$PROJECT_DIR/beyondtrust/terraform/jumpoint_id.txt")
-        local jumpclient_keyinfo=$(cat "$downloads_dir/jumpclient-keyinfo.txt" 2>/dev/null)
-        local jumpclient_response="$downloads_dir/jumpclient-response.json"
-        local jumpclient_installer_id=$(jq -r '.installer_id' "$jumpclient_response" 2>/dev/null)
-
-        if [ -z "$jumpoint_id" ] || [ -z "$jumpclient_keyinfo" ] || [ -z "$jumpclient_installer_id" ] || [ "$jumpclient_installer_id" = "null" ]; then
-            echo "ERROR: Missing installer IDs or key info from preparation step"
-            return 1
-        fi
-
-        local bt_token
-        bt_token=$(curl -s -X POST "${BT_API_HOST}/oauth2/token" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "grant_type=client_credentials&client_id=${BT_CLIENT_ID}&client_secret=${BT_CLIENT_SECRET}" \
-            | jq -r '.access_token // empty')
-
-        if [ -z "$bt_token" ]; then
-            echo "ERROR: Failed to get BeyondTrust API token for DC01"
-            return 1
-        fi
-
-        # PowerShell: DC01 downloads + installs both components directly from BT API
-        local ps_script='
-$ErrorActionPreference = "Continue"
-$token = "'"$bt_token"'"
-$btHost = "'"$BT_API_HOST"'"
-$jumpoint_id = "'"$jumpoint_id"'"
-$jc_installer_id = "'"$jumpclient_installer_id"'"
-$jc_key_info = "'"$jumpclient_keyinfo"'"
-
-$headers = @{ "Authorization" = "Bearer $token" }
-$tempDir = "C:\Temp\BeyondTrust"
-New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
-
-Write-Output "Downloading Jumpoint installer from BeyondTrust API..."
-$jumpoint_path = "$tempDir\jumpoint-installer.exe"
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Invoke-WebRequest -Uri "$btHost/api/config/v1/jumpoint/$jumpoint_id/installer" -Headers $headers -OutFile $jumpoint_path -UseBasicParsing
-Write-Output "Jumpoint downloaded: $([math]::Round((Get-Item $jumpoint_path).Length/1MB, 1)) MB"
-
-Write-Output "Downloading Jump Client installer from BeyondTrust API..."
-$jc_path = "$tempDir\jumpclient-installer.msi"
-Invoke-WebRequest -Uri "$btHost/api/config/v1/jump-client/installer/$jc_installer_id/windows-64-msi" -Headers $headers -OutFile $jc_path -UseBasicParsing
-Write-Output "Jump Client downloaded: $([math]::Round((Get-Item $jc_path).Length/1MB, 1)) MB"
-
-Write-Output "Installing Jumpoint..."
-Start-Process -FilePath $jumpoint_path -ArgumentList "/S" -Wait -PassThru -NoNewWindow | ForEach-Object { Write-Output "Jumpoint exit code: $($_.ExitCode)" }
-Start-Sleep -Seconds 10
-
-Write-Output "Installing Jump Client..."
-$logFile = "C:\Windows\Temp\jumpclient_install.log"
-$jc_proc = Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", "`"$jc_path`"", "/quiet", "/L*V", "`"$logFile`"", "KEY_INFO=$jc_key_info", "INSTALLDIR=`"C:\Program Files\BeyondTrust\JumpClient`"", "JC_JUMP_GROUP=domain_controllers") -Wait -PassThru
-Write-Output "Jump Client MSI exit code: $($jc_proc.ExitCode)"
-Start-Sleep -Seconds 15
-
-netsh advfirewall firewall add rule name="BeyondTrust HTTPS Out" dir=out action=allow protocol=TCP remoteport=443 2>$null
-netsh advfirewall firewall add rule name="BeyondTrust Service Out" dir=out action=allow protocol=TCP remoteport=8200 2>$null
-
-$installed = Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Where-Object { $_.DisplayName -like "*BeyondTrust*" -or $_.DisplayName -like "*Bomgar*" -or $_.DisplayName -like "*Jumpoint*" -or $_.DisplayName -like "*Jump Client*" } | Select-Object -ExpandProperty DisplayName
-$services = Get-Service -Name "*Jumpoint*","*BeyondTrust*","*Bomgar*","*JumpClient*" -ErrorAction SilentlyContinue
-Write-Output "Installed: $($installed -join ", ")"
-Write-Output "Services: $(($services | ForEach-Object { "$($_.Name): $($_.Status)" }) -join ", ")"
-'
-
-        echo "[$(date '+%H:%M:%S')] DC01-INSTALL: Running Azure VM run-command on DC01..."
-        local run_result
-        run_result=$(az vm run-command invoke \
-            --resource-group "rg-beyondtrust-${ENVIRONMENT}" \
-            --name "vm-dc-${ENVIRONMENT}" \
-            --command-id RunPowerShellScript \
-            --scripts "$ps_script" \
-            --output json 2>&1)
-
-        local az_exit=$?
-        if [ $az_exit -eq 0 ]; then
-            echo "$run_result" | jq -r '.value[0].message // "completed"' 2>/dev/null
-            echo "[$(date '+%H:%M:%S')] DC01-INSTALL: Complete"
-        else
-            echo "ERROR: Azure run-command for DC01 failed (exit $az_exit)"
-            echo "$run_result" | head -30
-            return 1
-        fi
+        echo "[$(date '+%H:%M:%S')] DC01-INSTALL: Starting via Ansible..."
+        cd "$PROJECT_DIR/ansible"
+        source "$HOME/.venvs/ansible/bin/activate"
+        timeout 600 ansible-playbook \
+            "$PROJECT_DIR/beyondtrust/ansible/install-beyondtrust.yml" \
+            -i inventory/hosts.yml \
+            -e @group_vars/windows.yml
+        local rc=$?
+        echo "[$(date '+%H:%M:%S')] DC01-INSTALL: Complete (exit code: $rc)"
+        return $rc
     }
 
     # --- Ubuntu installation (unchanged logic, extracted for parallelism) ---
@@ -1505,7 +1431,7 @@ systemctl list-units --type=service --no-legend | grep -iE 'scc|bomgar|beyond' |
 systemctl list-units --type=service --state=active --no-legend | grep -iE 'scc|bomgar|beyond' && echo 'Service is active' || echo 'WARNING: service not active yet'"
 
         local run_result
-        run_result=$(az vm run-command invoke \
+        run_result=$(timeout 600 az vm run-command invoke \
             --resource-group "rg-beyondtrust-${ENVIRONMENT}" \
             --name "vm-ubuntu-${ENVIRONMENT}" \
             --command-id RunShellScript \
