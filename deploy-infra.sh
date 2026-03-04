@@ -61,26 +61,28 @@ add_resource() {
     local resource_id="$2"
     local resource_name="$3"
     local additional_data="${4:-}"
-    
+
     init_state
-    
-    # If no additional data provided, use empty object (FIX)
+
     if [ -z "$additional_data" ]; then
         additional_data="{}"
     fi
-    
-    # Add resource to state file
-    jq --arg type "$resource_type" \
-       --arg id "$resource_id" \
-       --arg name "$resource_name" \
-       --argjson data "$additional_data" \
-       --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-       '.resources[$type] += [{
-           id: $id, 
-           name: $name, 
-           created_at: $timestamp
-       } + $data]' \
-       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+
+    # flock to prevent concurrent-write corruption from parallel processes
+    (
+        flock -w 10 200
+        jq --arg type "$resource_type" \
+           --arg id "$resource_id" \
+           --arg name "$resource_name" \
+           --argjson data "$additional_data" \
+           --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+           '.resources[$type] += [{
+               id: $id,
+               name: $name,
+               created_at: $timestamp
+           } + $data]' \
+           "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    ) 200>"${STATE_FILE}.lock"
 }
 
 get_resources() {
@@ -94,25 +96,31 @@ get_resources() {
 update_metadata() {
     local key="$1"
     local value="$2"
-    
+
     init_state
-    
-    jq --arg key "$key" \
-       --arg value "$value" \
-       '.metadata[$key] = $value' \
-       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+
+    (
+        flock -w 10 200
+        jq --arg key "$key" \
+           --arg value "$value" \
+           '.metadata[$key] = $value' \
+           "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    ) 200>"${STATE_FILE}.lock"
 }
 
 update_azure_info() {
     local key="$1"
     local value="$2"
-    
+
     init_state
-    
-    jq --arg key "$key" \
-       --arg value "$value" \
-       '.azure[$key] = $value' \
-       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+
+    (
+        flock -w 10 200
+        jq --arg key "$key" \
+           --arg value "$value" \
+           '.azure[$key] = $value' \
+           "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    ) 200>"${STATE_FILE}.lock"
 }
 
 # Create initial directory structure
@@ -828,10 +836,12 @@ EOF
     
     # Register required resource providers
     print_status "Registering required Azure resource providers..."
-    az provider register --namespace Microsoft.SqlVirtualMachine --wait
-    az provider register --namespace Microsoft.Compute --wait
-    az provider register --namespace Microsoft.Network --wait
-    az provider register --namespace Microsoft.Storage --wait
+    print_status "Registering Azure providers in parallel..."
+    az provider register --namespace Microsoft.SqlVirtualMachine --wait &
+    az provider register --namespace Microsoft.Compute --wait &
+    az provider register --namespace Microsoft.Network --wait &
+    az provider register --namespace Microsoft.Storage --wait &
+    wait
 
     # Deploy infrastructure
     print_status "Deploying Azure infrastructure with Terraform..."
@@ -1235,107 +1245,136 @@ EOF
         print_warning "AD services did not confirm ready within 4 minutes — proceeding anyway"
     fi
 
-    print_status "Configuring SQL server..."
-    ansible-playbook playbooks/02-configure-sql.yml -e @group_vars/windows.yml
+    # Run SQL domain join + AD user creation in PARALLEL
+    # - 02 uses DC as a proxy to join SQL01 to the domain (Invoke-Command to SQL01)
+    # - 03 creates AD users directly on DC (different subsystem, no conflict)
+    print_status "Configuring SQL server + creating demo users (parallel)..."
 
-    print_status "Creating demo users..."
-    ansible-playbook playbooks/03-create-users.yml -e @group_vars/windows.yml
+    ansible-playbook playbooks/02-configure-sql.yml -e @group_vars/windows.yml \
+        > "$PROJECT_DIR/ansible-sql.log" 2>&1 &
+    local SQL_PID=$!
+
+    ansible-playbook playbooks/03-create-users.yml -e @group_vars/windows.yml \
+        > "$PROJECT_DIR/ansible-users.log" 2>&1 &
+    local USERS_PID=$!
+
+    local domain_ok=true
+    if ! wait $SQL_PID; then
+        print_error "SQL server configuration failed"
+        domain_ok=false
+    fi
+    print_status "=== SQL Configuration Log ==="
+    cat "$PROJECT_DIR/ansible-sql.log"
+
+    if ! wait $USERS_PID; then
+        print_error "User creation failed"
+        domain_ok=false
+    fi
+    print_status "=== User Creation Log ==="
+    cat "$PROJECT_DIR/ansible-users.log"
+
+    if [ "$domain_ok" = false ]; then
+        print_error "Domain configuration had failures — check logs above"
+    fi
 
     deactivate
     popd > /dev/null
 }
 
-# Phase 3: BeyondTrust Integration
-deploy_beyondtrust() {
-    print_status "Phase 3: Deploying BeyondTrust PRA integration..."
-    
+# =============================================================================
+# Phase 3: BeyondTrust Integration — split into 3 functions for parallelism.
+#
+#   prepare_beyondtrust()              — BT terraform + policies + downloads.
+#                                        No Azure VM dependency; can run in
+#                                        background while domain is configured.
+#   install_beyondtrust_software()     — Install on DC01 + Ubuntu in parallel.
+#                                        Needs DC online + installers ready.
+#   finalize_beyondtrust()             — Jump items + vault in parallel.
+#                                        Needs policies + groups to exist.
+# =============================================================================
+
+prepare_beyondtrust() {
+    echo "[$(date '+%H:%M:%S')] BT-PREP: Starting BeyondTrust preparation..."
+
     cd "$PROJECT_DIR"
-    
-    # Source config and EXPORT ALL VARIABLES (FIX)
+
     source "$CONFIG_FILE"
     export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET RESOURCE_PREFIX APPROVER_EMAIL
     export JUMP_GROUP_DEMO JUMP_GROUP_DC JUMPOINT_NAME ADMIN_USERNAME ADMIN_PASSWORD DOMAIN_NAME
-    export VAULT_ACCOUNT_GROUP_ID
+    export VAULT_ACCOUNT_GROUP_ID JUMP_GROUP_LINUX LINUX_ADMIN_USERNAME LINUX_ADMIN_PASSWORD
+    export DOMAIN_NETBIOS_NAME
 
-    # Update state
     update_metadata "beyondtrust_instance" "$BT_API_HOST"
     update_metadata "resource_prefix" "$RESOURCE_PREFIX"
-    
-    # Create all BeyondTrust scripts
+
+    # Generate all BeyondTrust scripts
     create_beyondtrust_terraform_config
     create_beyondtrust_api_helper
     create_beyondtrust_state_helper
-    create_beyondtrust_run_wrapper  # NEW: Create wrapper script
+    create_beyondtrust_run_wrapper
     create_beyondtrust_policy_script
     create_beyondtrust_installer_script
     create_beyondtrust_jump_items_script
     create_beyondtrust_vault_script
     create_beyondtrust_cleanup_script
     create_beyondtrust_ansible_playbook
-    
-    # Step 1: Deploy Terraform resources
-    print_status "Deploying BeyondTrust Terraform resources..."
+
+    # Step 1: Deploy Terraform resources (BT API only — no Azure dependency)
+    echo "[$(date '+%H:%M:%S')] BT-PREP: Deploying BeyondTrust Terraform resources..."
     pushd "$PROJECT_DIR/beyondtrust/terraform" > /dev/null
     terraform init
     terraform apply -auto-approve
 
-    # Save IDs for later use
     terraform output -raw jump_group_demo_id > demo_group_id.txt
     terraform output -raw jump_group_dc_id > dc_group_id.txt
     terraform output -raw jumpoint_id > jumpoint_id.txt
     terraform output -raw jump_group_linux_id > linux_group_id.txt
 
-    # Track Terraform resources in state
     add_resource "jump_group" "$(cat demo_group_id.txt)" "$JUMP_GROUP_DEMO" '{"type": "shared", "managed_by": "terraform"}'
     add_resource "jump_group" "$(cat dc_group_id.txt)" "$JUMP_GROUP_DC" '{"type": "shared", "managed_by": "terraform"}'
     add_resource "jump_group" "$(cat linux_group_id.txt)" "$JUMP_GROUP_LINUX" '{"type": "shared", "managed_by": "terraform"}'
     add_resource "jumpoint" "$(cat jumpoint_id.txt)" "$JUMPOINT_NAME" '{"platform": "windows-x86", "managed_by": "terraform"}'
     popd > /dev/null
 
-    # Step 2: Create policies via API (using wrapper)
-    print_status "Creating jump policies..."
+    # Step 2: Create policies via API
+    echo "[$(date '+%H:%M:%S')] BT-PREP: Creating jump policies..."
     (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh create-policies.sh)
 
-    # Step 3: Download installers (using wrapper)
-    print_status "Downloading installers..."
+    # Step 3: Download all 3 installers (parallelized inside the script)
+    echo "[$(date '+%H:%M:%S')] BT-PREP: Downloading installers (parallel)..."
     (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh download-installers.sh) || {
-        print_error "Failed to download installers. Check your BeyondTrust API credentials and network connectivity."
+        echo "ERROR: Failed to download installers."
+        return 1
     }
 
-    # Step 4: Install software via Ansible
-    print_status "Installing BeyondTrust software on DC01..."
-    pushd "$PROJECT_DIR/ansible" > /dev/null
+    echo "[$(date '+%H:%M:%S')] BT-PREP: BeyondTrust preparation complete"
+}
 
-    # Activate virtual environment if needed
-    if [ -f "$HOME/.venvs/ansible/bin/activate" ]; then
-        source "$HOME/.venvs/ansible/bin/activate"
-    fi
+install_beyondtrust_software() {
+    print_status "Phase 3b: Installing BeyondTrust software (DC01 + Ubuntu in parallel)..."
 
-    ansible-playbook "$PROJECT_DIR/beyondtrust/ansible/install-beyondtrust.yml" \
-        -i inventory/hosts.yml \
-        -e @group_vars/windows.yml || {
-        print_warning "Ansible installation encountered issues. Continuing with API configuration..."
-    }
+    cd "$PROJECT_DIR"
+    source "$CONFIG_FILE"
+    export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET RESOURCE_PREFIX
+    export DOMAIN_NAME ADMIN_USERNAME ADMIN_PASSWORD
+    export JUMP_GROUP_DC JUMPOINT_NAME JUMP_GROUP_LINUX
 
-    if [ -n "$VIRTUAL_ENV" ]; then
-        deactivate
-    fi
-    popd > /dev/null
-
-    # Step 4b: Install Jump Client on Ubuntu directly via Azure VM run-command
-    # (bypasses Ansible entirely — avoids WinRM/SSH connection plugin conflicts)
-    print_status "Installing BeyondTrust Jump Client on Ubuntu via Azure run-command..."
     local downloads_dir="$PROJECT_DIR/beyondtrust/downloads"
-    local key_info_file="$downloads_dir/jumpclient-linux-keyinfo.txt"
-    local installer_id_file="$downloads_dir/jumpclient-linux-installer-id.txt"
 
-    if [ -f "$key_info_file" ] && [ -f "$installer_id_file" ]; then
-        local bt_key_info
-        bt_key_info=$(cat "$key_info_file")
-        local bt_installer_id
-        bt_installer_id=$(cat "$installer_id_file")
+    # --- DC01 installation via Azure VM run-command (replaces slow win_copy) ---
+    _install_bt_on_dc01() {
+        echo "[$(date '+%H:%M:%S')] DC01-INSTALL: Starting..."
 
-        # Get a fresh BeyondTrust API token for the VM to download the installer
+        local jumpoint_id=$(cat "$PROJECT_DIR/beyondtrust/terraform/jumpoint_id.txt")
+        local jumpclient_keyinfo=$(cat "$downloads_dir/jumpclient-keyinfo.txt" 2>/dev/null)
+        local jumpclient_response="$downloads_dir/jumpclient-response.json"
+        local jumpclient_installer_id=$(jq -r '.installer_id' "$jumpclient_response" 2>/dev/null)
+
+        if [ -z "$jumpoint_id" ] || [ -z "$jumpclient_keyinfo" ] || [ -z "$jumpclient_installer_id" ] || [ "$jumpclient_installer_id" = "null" ]; then
+            echo "ERROR: Missing installer IDs or key info from preparation step"
+            return 1
+        fi
+
         local bt_token
         bt_token=$(curl -s -X POST "${BT_API_HOST}/oauth2/token" \
             -H "Content-Type: application/x-www-form-urlencoded" \
@@ -1343,10 +1382,101 @@ deploy_beyondtrust() {
             | jq -r '.access_token // empty')
 
         if [ -z "$bt_token" ]; then
-            print_warning "Failed to get BeyondTrust API token — skipping Ubuntu Jump Client installation"
+            echo "ERROR: Failed to get BeyondTrust API token for DC01"
+            return 1
+        fi
+
+        # PowerShell: DC01 downloads + installs both components directly from BT API
+        local ps_script='
+$ErrorActionPreference = "Continue"
+$token = "'"$bt_token"'"
+$btHost = "'"$BT_API_HOST"'"
+$jumpoint_id = "'"$jumpoint_id"'"
+$jc_installer_id = "'"$jumpclient_installer_id"'"
+$jc_key_info = "'"$jumpclient_keyinfo"'"
+
+$headers = @{ "Authorization" = "Bearer $token" }
+$tempDir = "C:\Temp\BeyondTrust"
+New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+
+Write-Output "Downloading Jumpoint installer from BeyondTrust API..."
+$jumpoint_path = "$tempDir\jumpoint-installer.exe"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Invoke-WebRequest -Uri "$btHost/api/config/v1/jumpoint/$jumpoint_id/installer" -Headers $headers -OutFile $jumpoint_path -UseBasicParsing
+Write-Output "Jumpoint downloaded: $([math]::Round((Get-Item $jumpoint_path).Length/1MB, 1)) MB"
+
+Write-Output "Downloading Jump Client installer from BeyondTrust API..."
+$jc_path = "$tempDir\jumpclient-installer.msi"
+Invoke-WebRequest -Uri "$btHost/api/config/v1/jump-client/installer/$jc_installer_id/windows-64-msi" -Headers $headers -OutFile $jc_path -UseBasicParsing
+Write-Output "Jump Client downloaded: $([math]::Round((Get-Item $jc_path).Length/1MB, 1)) MB"
+
+Write-Output "Installing Jumpoint..."
+Start-Process -FilePath $jumpoint_path -ArgumentList "/S" -Wait -PassThru -NoNewWindow | ForEach-Object { Write-Output "Jumpoint exit code: $($_.ExitCode)" }
+Start-Sleep -Seconds 10
+
+Write-Output "Installing Jump Client..."
+$logFile = "C:\Windows\Temp\jumpclient_install.log"
+$jc_proc = Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", "`"$jc_path`"", "/quiet", "/L*V", "`"$logFile`"", "KEY_INFO=$jc_key_info", "INSTALLDIR=`"C:\Program Files\BeyondTrust\JumpClient`"", "JC_JUMP_GROUP=domain_controllers") -Wait -PassThru
+Write-Output "Jump Client MSI exit code: $($jc_proc.ExitCode)"
+Start-Sleep -Seconds 15
+
+netsh advfirewall firewall add rule name="BeyondTrust HTTPS Out" dir=out action=allow protocol=TCP remoteport=443 2>$null
+netsh advfirewall firewall add rule name="BeyondTrust Service Out" dir=out action=allow protocol=TCP remoteport=8200 2>$null
+
+$installed = Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Where-Object { $_.DisplayName -like "*BeyondTrust*" -or $_.DisplayName -like "*Bomgar*" -or $_.DisplayName -like "*Jumpoint*" -or $_.DisplayName -like "*Jump Client*" } | Select-Object -ExpandProperty DisplayName
+$services = Get-Service -Name "*Jumpoint*","*BeyondTrust*","*Bomgar*","*JumpClient*" -ErrorAction SilentlyContinue
+Write-Output "Installed: $($installed -join ", ")"
+Write-Output "Services: $(($services | ForEach-Object { "$($_.Name): $($_.Status)" }) -join ", ")"
+'
+
+        echo "[$(date '+%H:%M:%S')] DC01-INSTALL: Running Azure VM run-command on DC01..."
+        local run_result
+        run_result=$(az vm run-command invoke \
+            --resource-group "rg-beyondtrust-${ENVIRONMENT}" \
+            --name "vm-dc-${ENVIRONMENT}" \
+            --command-id RunPowerShellScript \
+            --scripts "$ps_script" \
+            --output json 2>&1)
+
+        local az_exit=$?
+        if [ $az_exit -eq 0 ]; then
+            echo "$run_result" | jq -r '.value[0].message // "completed"' 2>/dev/null
+            echo "[$(date '+%H:%M:%S')] DC01-INSTALL: Complete"
         else
-            local ubuntu_script
-            ubuntu_script="echo 'Downloading Jump Client installer from BeyondTrust...'
+            echo "ERROR: Azure run-command for DC01 failed (exit $az_exit)"
+            echo "$run_result" | head -30
+            return 1
+        fi
+    }
+
+    # --- Ubuntu installation (unchanged logic, extracted for parallelism) ---
+    _install_bt_on_ubuntu() {
+        echo "[$(date '+%H:%M:%S')] UBUNTU-INSTALL: Starting..."
+
+        local key_info_file="$downloads_dir/jumpclient-linux-keyinfo.txt"
+        local installer_id_file="$downloads_dir/jumpclient-linux-installer-id.txt"
+
+        if [ ! -f "$key_info_file" ] || [ ! -f "$installer_id_file" ]; then
+            echo "WARNING: Linux Jump Client files not found — skipping"
+            return 0
+        fi
+
+        local bt_key_info bt_installer_id bt_token
+        bt_key_info=$(cat "$key_info_file")
+        bt_installer_id=$(cat "$installer_id_file")
+
+        bt_token=$(curl -s -X POST "${BT_API_HOST}/oauth2/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials&client_id=${BT_CLIENT_ID}&client_secret=${BT_CLIENT_SECRET}" \
+            | jq -r '.access_token // empty')
+
+        if [ -z "$bt_token" ]; then
+            echo "WARNING: Failed to get BT API token — skipping Ubuntu Jump Client"
+            return 0
+        fi
+
+        local ubuntu_script
+        ubuntu_script="echo 'Downloading Jump Client installer from BeyondTrust...'
 touch /tmp/jc_before
 cd /tmp
 curl -sf -J -O -H 'Authorization: Bearer ${bt_token}' '${BT_API_HOST}/api/config/v1/jump-client/installer/${bt_installer_id}/linux-64'
@@ -1354,61 +1484,102 @@ INSTALLER=\$(find /tmp -maxdepth 1 -newer /tmp/jc_before -type f 2>/dev/null | h
 rm -f /tmp/jc_before
 if [ -z \"\$INSTALLER\" ]; then
   echo 'ERROR: installer not found after download'
-  ls -la /tmp/
   exit 1
 fi
 echo \"Found installer: \$INSTALLER\"
 chmod +x \"\$INSTALLER\"
-echo 'Installing Jump Client...'
 \"\$INSTALLER\" --key-info '${bt_key_info}' --headless --scope system --startup systemd --install-dir /opt/beyondtrust/jumpclient --session-user linuxadmin
 INSTALL_RC=\$?
 echo \"Installer exit code: \$INSTALL_RC\"
 if [ \$INSTALL_RC -ne 0 ]; then
-  echo 'ERROR: Jump Client installation failed with exit code '\$INSTALL_RC
+  echo 'ERROR: Jump Client installation failed'
   exit 1
 fi
 echo 'Jump Client installation complete'
-echo 'Checking service status...'
 sleep 10
 systemctl list-units --type=service --no-legend | grep -iE 'scc|bomgar|beyond' || echo 'WARNING: no BeyondTrust service unit found'
-systemctl list-units --type=service --state=active --no-legend | grep -iE 'scc|bomgar|beyond' && echo 'Service is active' || echo 'WARNING: service not active yet'
-echo 'Recent service journal (last 30 lines):'
-journalctl --no-pager -n 30 2>/dev/null | grep -iE 'scc|bomgar|beyond|jumpclient' || echo 'No relevant journal entries found'"
+systemctl list-units --type=service --state=active --no-legend | grep -iE 'scc|bomgar|beyond' && echo 'Service is active' || echo 'WARNING: service not active yet'"
 
-            local run_result
-            run_result=$(az vm run-command invoke \
-                --resource-group "rg-beyondtrust-${ENVIRONMENT}" \
-                --name "vm-ubuntu-${ENVIRONMENT}" \
-                --command-id RunShellScript \
-                --scripts "$ubuntu_script" \
-                --output json 2>&1)
+        local run_result
+        run_result=$(az vm run-command invoke \
+            --resource-group "rg-beyondtrust-${ENVIRONMENT}" \
+            --name "vm-ubuntu-${ENVIRONMENT}" \
+            --command-id RunShellScript \
+            --scripts "$ubuntu_script" \
+            --output json 2>&1)
 
-            local az_exit=$?
-            if [ $az_exit -eq 0 ]; then
-                local stdout
-                stdout=$(echo "$run_result" | jq -r '.value[0].message // "completed"' 2>/dev/null)
-                print_status "Ubuntu Jump Client installation output:"
-                echo "$stdout"
-            else
-                print_warning "Azure run-command for Ubuntu returned non-zero exit ($az_exit). Output:"
-                echo "$run_result" | head -20
-            fi
+        local az_exit=$?
+        if [ $az_exit -eq 0 ]; then
+            echo "$run_result" | jq -r '.value[0].message // "completed"' 2>/dev/null
+            echo "[$(date '+%H:%M:%S')] UBUNTU-INSTALL: Complete"
+        else
+            echo "WARNING: Azure run-command for Ubuntu returned non-zero exit ($az_exit)"
+            echo "$run_result" | head -20
         fi
-    else
-        print_warning "Linux Jump Client download files not found — skipping Ubuntu installation"
-        print_warning "  Missing: ${key_info_file} or ${installer_id_file}"
+    }
+
+    # Run DC01 + Ubuntu installations in parallel
+    _install_bt_on_dc01 > "$PROJECT_DIR/dc01-bt-install.log" 2>&1 &
+    local DC_PID=$!
+    _install_bt_on_ubuntu > "$PROJECT_DIR/ubuntu01-bt-install.log" 2>&1 &
+    local UBUNTU_PID=$!
+
+    print_status "BeyondTrust installations running in parallel (DC01 PID=$DC_PID, Ubuntu PID=$UBUNTU_PID)..."
+
+    local install_ok=true
+    if ! wait $DC_PID; then
+        print_warning "DC01 BeyondTrust installation encountered issues"
+        install_ok=false
     fi
+    print_status "=== DC01 Installation Log ==="
+    cat "$PROJECT_DIR/dc01-bt-install.log"
 
-    # Step 5: Configure jump items (using wrapper)
-    print_status "Configuring jump items..."
-    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-jump-items.sh)
+    if ! wait $UBUNTU_PID; then
+        print_warning "Ubuntu Jump Client installation encountered issues"
+        install_ok=false
+    fi
+    print_status "=== Ubuntu Installation Log ==="
+    cat "$PROJECT_DIR/ubuntu01-bt-install.log"
 
-    # Step 6: Configure vault (using wrapper)
-    print_status "Configuring vault accounts..."
-    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-vault.sh)
+    if [ "$install_ok" = true ]; then
+        print_status "All BeyondTrust software installations completed"
+    else
+        print_warning "Some installations had issues — continuing with configuration"
+    fi
+}
 
-    # Update deployment completed timestamp
+finalize_beyondtrust() {
+    print_status "Phase 3c: Configuring BeyondTrust jump items + vault (parallel)..."
+
+    cd "$PROJECT_DIR"
+    source "$CONFIG_FILE"
+    export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET RESOURCE_PREFIX APPROVER_EMAIL
+    export JUMP_GROUP_DEMO JUMP_GROUP_DC JUMPOINT_NAME ADMIN_USERNAME ADMIN_PASSWORD DOMAIN_NAME
+    export VAULT_ACCOUNT_GROUP_ID JUMP_GROUP_LINUX LINUX_ADMIN_USERNAME LINUX_ADMIN_PASSWORD
+    export DOMAIN_NETBIOS_NAME
+
+    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-jump-items.sh) \
+        > "$PROJECT_DIR/jump-items.log" 2>&1 &
+    local JUMP_PID=$!
+
+    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-vault.sh) \
+        > "$PROJECT_DIR/vault.log" 2>&1 &
+    local VAULT_PID=$!
+
+    if ! wait $JUMP_PID; then
+        print_warning "Jump items configuration had issues"
+    fi
+    print_status "=== Jump Items Log ==="
+    cat "$PROJECT_DIR/jump-items.log"
+
+    if ! wait $VAULT_PID; then
+        print_warning "Vault configuration had issues"
+    fi
+    print_status "=== Vault Log ==="
+    cat "$PROJECT_DIR/vault.log"
+
     update_metadata "deployment_completed" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    print_status "BeyondTrust configuration complete"
 }
 
 # NEW: Create run wrapper script
@@ -1613,18 +1784,21 @@ add_bt_resource() {
         additional_data="{}"
     fi
     
-    # Add resource to state file
-    jq --arg type "$resource_type" \
-       --arg id "$resource_id" \
-       --arg name "$resource_name" \
-       --argjson data "$additional_data" \
-       --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-       '.resources[$type] += [{
-           id: $id, 
-           name: $name, 
-           created_at: $timestamp
-       } + $data]' \
-       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    # flock to prevent concurrent-write corruption from parallel processes
+    (
+        flock -w 10 200
+        jq --arg type "$resource_type" \
+           --arg id "$resource_id" \
+           --arg name "$resource_name" \
+           --argjson data "$additional_data" \
+           --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+           '.resources[$type] += [{
+               id: $id,
+               name: $name,
+               created_at: $timestamp
+           } + $data]' \
+           "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    ) 200>"${STATE_FILE}.lock"
 }
 
 get_bt_resources() {
@@ -1951,26 +2125,38 @@ JSON
     cd - > /dev/null
 }
 
-# Main execution
-download_jumpoint
-if [ $? -ne 0 ]; then
+# Main execution — download all 3 installers in parallel
+echo "Starting parallel installer downloads..."
+
+download_jumpoint &
+JP_PID=$!
+
+create_jump_client &
+JC_PID=$!
+
+create_linux_jump_client &
+LJC_PID=$!
+
+DOWNLOAD_FAILED=false
+if ! wait $JP_PID; then
     echo "ERROR: Jumpoint download failed"
-    exit 1
+    DOWNLOAD_FAILED=true
 fi
-
-create_jump_client
-if [ $? -ne 0 ]; then
+if ! wait $JC_PID; then
     echo "ERROR: Jump Client download failed"
-    exit 1
+    DOWNLOAD_FAILED=true
 fi
-
-create_linux_jump_client
-if [ $? -ne 0 ]; then
+if ! wait $LJC_PID; then
     echo "ERROR: Linux Jump Client download failed"
+    DOWNLOAD_FAILED=true
+fi
+
+if [ "$DOWNLOAD_FAILED" = true ]; then
+    echo "ERROR: One or more downloads failed"
     exit 1
 fi
 
-echo "Download process completed"
+echo "All downloads completed successfully"
 EOF
     
     chmod +x beyondtrust/scripts/download-installers.sh
@@ -3213,11 +3399,35 @@ main() {
     # Phase 1: Deploy Azure Infrastructure
     deploy_azure_infrastructure
     
-    # Phase 2: Configure Domain (DC reboots once during promotion; SQL01 domain join deferred)
+    # =========================================================================
+    # Phase 2 + Phase 3 preparation run IN PARALLEL
+    #
+    #   Track A (foreground): Domain config — DC promotion, SQL join, users
+    #   Track B (background): BT terraform + policies + installer downloads
+    #
+    # BT preparation has zero dependency on Azure VMs — only the BT API.
+    # Running it in the background hides ~4-7 minutes behind domain config.
+    # =========================================================================
+    print_status "Starting BeyondTrust preparation in background..."
+    prepare_beyondtrust > "$PROJECT_DIR/bt-prep.log" 2>&1 &
+    BT_PREP_PID=$!
+
+    # Phase 2: Configure Domain (foreground — DC reboot is the critical path)
     configure_domain
 
-    # Phase 3: Deploy BeyondTrust
-    deploy_beyondtrust
+    # Wait for BT preparation to finish (should already be done by now)
+    print_status "Waiting for BeyondTrust preparation to complete (PID=$BT_PREP_PID)..."
+    if ! wait $BT_PREP_PID; then
+        print_error "BeyondTrust preparation failed. Log:"
+        cat "$PROJECT_DIR/bt-prep.log"
+        exit 1
+    fi
+    print_status "=== BeyondTrust Preparation Log ==="
+    cat "$PROJECT_DIR/bt-prep.log"
+    echo ""
+
+    # Phase 3b: Install BT software on DC01 + Ubuntu (parallel, needs DC + installers)
+    install_beyondtrust_software
 
     # Phase 4 pre-reboot: install RDS prerequisites before SQL01 reboot (optional)
     if [ "$WITH_RDS" = true ]; then
@@ -3227,6 +3437,9 @@ main() {
     # Finalize SQL01: single reboot to apply domain join (+ RDS roles if applicable),
     # then run post-reboot SQL configuration (RDP access, SQL logins)
     reboot_sql_server
+
+    # Phase 3c: Configure BT jump items + vault (parallel)
+    finalize_beyondtrust
 
     # Phase 4 post-reboot: configure RDS services that need domain auth (optional)
     if [ "$WITH_RDS" = true ]; then
