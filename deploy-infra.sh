@@ -2980,7 +2980,7 @@ configure_rds_deployment() {
     local rds_deploy_result
     rds_deploy_result=$(ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
         -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Import-Module RemoteDesktop; try { New-RDSessionDeployment -ConnectionBroker "SQL01.{{ domain_name }}" -SessionHost "SQL01.{{ domain_name }}" -ErrorAction Stop; Write-Host "RDS_CREATED" } catch { if ($_.Exception.Message -like "*already*") { Write-Host "RDS_EXISTS" } else { throw $_ } } }' \
-        -e @group_vars/windows.yml 2>&1)
+        -e @group_vars/windows.yml 2>&1) || true
 
     local rds_deploy_msg
     rds_deploy_msg=$(echo "$rds_deploy_result" | grep -oE "RDS_CREATED|RDS_EXISTS" | tail -1)
@@ -3009,7 +3009,7 @@ publish_ssms_remoteapp() {
     local remoteapp_result
     remoteapp_result=$(ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
         -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication CredSSP -ScriptBlock { Import-Module RemoteDesktop; $broker = "SQL01.{{ domain_name }}"; try { $existing = Get-RDSessionCollection -CollectionName "RemoteApps" -ConnectionBroker $broker -ErrorAction SilentlyContinue; if (-not $existing) { New-RDSessionCollection -CollectionName "RemoteApps" -SessionHost $broker -ConnectionBroker $broker -CollectionDescription "Remote Applications Collection" -ErrorAction Stop }; $ssmsPath = Get-ChildItem -Path "C:\Program Files (x86)\Microsoft SQL Server Management Studio*","C:\Program Files\Microsoft SQL Server Management Studio*" -Filter "Ssms.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName; if (-not $ssmsPath) { Write-Host "SSMS_NOT_FOUND"; exit 1 }; try { Remove-RDRemoteApp -CollectionName "RemoteApps" -Alias "SSMS" -ConnectionBroker $broker -Force -ErrorAction SilentlyContinue } catch {}; New-RDRemoteApp -CollectionName "RemoteApps" -DisplayName "SQL Server Management Studio" -FilePath $ssmsPath -Alias "SSMS" -ShowInWebAccess $true -ConnectionBroker $broker -IconPath "C:\Windows\System32\shell32.dll" -IconIndex 0; Write-Host "REMOTEAPP_OK" } catch { Write-Host "ERROR: $_"; exit 1 } }' \
-        -e @group_vars/windows.yml 2>&1)
+        -e @group_vars/windows.yml 2>&1) || true
 
     local remoteapp_msg
     remoteapp_msg=$(echo "$remoteapp_result" | grep -oE "REMOTEAPP_OK|SSMS_NOT_FOUND" | tail -1)
