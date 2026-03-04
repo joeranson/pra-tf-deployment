@@ -838,10 +838,14 @@ EOF
     print_status "Registering required Azure resource providers..."
     print_status "Registering Azure providers in parallel..."
     az provider register --namespace Microsoft.SqlVirtualMachine --wait &
+    local REG_PID1=$!
     az provider register --namespace Microsoft.Compute --wait &
+    local REG_PID2=$!
     az provider register --namespace Microsoft.Network --wait &
+    local REG_PID3=$!
     az provider register --namespace Microsoft.Storage --wait &
-    wait
+    local REG_PID4=$!
+    wait $REG_PID1 $REG_PID2 $REG_PID3 $REG_PID4
 
     # Deploy infrastructure
     print_status "Deploying Azure infrastructure with Terraform..."
