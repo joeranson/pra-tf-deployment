@@ -2864,9 +2864,68 @@ configure_rds_deployment() {
         --output json 2>&1)
     echo "$rds_state_result" | jq -r '.value[0].message // ""'
 
-    # DC proxies New-RDSessionDeployment to SQL01 via CredSSP with explicit domain-admin
-    # credentials. RDS roles were installed at Terraform time (azurerm_virtual_machine_run_command),
-    # so the consolidated reboot has already cleared any pending reboot state.
+    # RDS roles were installed at Terraform time (azurerm_virtual_machine_run_command).
+    # The consolidated reboot should have cleared pending state, but Windows Updates
+    # or Group Policy can re-create pending reboots. Check and reboot if needed.
+    print_status "Checking for pending reboots on SQL01..."
+    local pending_check
+    pending_check=$(az vm run-command invoke \
+        --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+        --name "vm-sql-$ENVIRONMENT" \
+        --command-id RunPowerShellScript \
+        --scripts '
+$cbs = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
+$wu  = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+$pfr = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -EA SilentlyContinue) -ne $null
+if ($cbs -or $wu -or $pfr) { Write-Output "REBOOT_NEEDED cbs=$cbs wu=$wu pfr=$pfr" } else { Write-Output "NO_REBOOT_NEEDED" }
+' \
+        --output json 2>&1)
+    local pending_msg
+    pending_msg=$(echo "$pending_check" | jq -r '.value[0].message // ""')
+    echo "$pending_msg"
+
+    if echo "$pending_msg" | grep -q "REBOOT_NEEDED"; then
+        print_warning "SQL01 has pending reboots — rebooting before RDS deployment..."
+        az vm run-command invoke \
+            --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+            --name "vm-sql-$ENVIRONMENT" \
+            --command-id RunPowerShellScript \
+            --scripts 'shutdown /r /t 5 /c "Clear pending reboots for RDS"' \
+            --output json > /dev/null 2>&1 || true
+
+        print_status "Waiting for SQL01 to reboot (45 seconds)..."
+        sleep 45
+
+        # Poll until WinRM is back
+        local max_attempts=30
+        local attempt=1
+        while [ $attempt -le $max_attempts ]; do
+            if az vm run-command invoke \
+                --resource-group "rg-beyondtrust-$ENVIRONMENT" \
+                --name "vm-sql-$ENVIRONMENT" \
+                --command-id RunPowerShellScript \
+                --scripts 'Write-Output "ONLINE"' \
+                --output json 2>&1 | jq -r '.value[0].message // ""' | grep -q "ONLINE"; then
+                print_status "SQL01 is back online after RDS reboot"
+                break
+            fi
+            print_warning "Waiting for SQL01... (attempt $attempt/$max_attempts)"
+            sleep 10
+            ((attempt++))
+        done
+
+        if [ $attempt -gt $max_attempts ]; then
+            print_error "SQL01 did not come back online after RDS reboot"
+            exit 1
+        fi
+
+        print_status "Waiting for services to stabilize (30 seconds)..."
+        sleep 30
+    else
+        print_status "No pending reboots — proceeding with RDS deployment"
+    fi
+
+    # DC proxies New-RDSessionDeployment to SQL01 via CredSSP with explicit domain-admin credentials.
     print_status "Creating RDS deployment..."
     cd "$PROJECT_DIR/ansible"
     local rds_deploy_result
