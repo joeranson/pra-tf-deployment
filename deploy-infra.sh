@@ -820,6 +820,27 @@ output "deployment_info" {
 }
 EOF
 
+    # Conditionally add RDS roles run command to Terraform config
+    if [ "$WITH_RDS" = true ]; then
+        cat >> terraform/main.tf << 'RDSEOF'
+
+resource "azurerm_virtual_machine_run_command" "sql_rds_roles" {
+  name               = "InstallRDSRoles-SQL"
+  location           = azurerm_resource_group.demo.location
+  virtual_machine_id = azurerm_windows_virtual_machine.sql.id
+
+  source {
+    script = <<-EOT
+      $r = Install-WindowsFeature -Name RDS-RD-Server,RDS-Connection-Broker,RDS-Web-Access -IncludeManagementTools -Restart:$false
+      Write-Output "Success=$($r.Success) RestartNeeded=$($r.RestartNeeded) ExitCode=$($r.ExitCode)"
+    EOT
+  }
+
+  depends_on = [azurerm_virtual_machine_run_command.sql_iis]
+}
+RDSEOF
+    fi
+
     # Create tfvars
     cat > terraform/terraform.tfvars << EOF
 environment           = "$ENVIRONMENT"
@@ -2798,135 +2819,6 @@ reboot_sql_server() {
 # Run after the main three-phase deployment completes.
 # =============================================================================
 
-# Phase 4 — Step 1: Install Chocolatey on SQL01
-install_chocolatey() {
-    print_status "Installing Chocolatey on SQL server..."
-
-    cd "$PROJECT_DIR/ansible"
-
-    local choco_check
-    choco_check=$(ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -ScriptBlock { if (Test-Path "C:\ProgramData\chocolatey\bin\choco.exe") { "installed" } else { "not-installed" } }' \
-        -e @group_vars/windows.yml 2>/dev/null | grep -o "installed\|not-installed" | tail -1)
-
-    if [ "$choco_check" = "installed" ]; then
-        print_status "Chocolatey already installed, skipping..."
-    else
-        print_status "Installing Chocolatey via Azure VM Run Command (bypasses WinRM restrictions)..."
-        local choco_result
-        choco_result=$(az vm run-command invoke \
-            --resource-group "rg-beyondtrust-$ENVIRONMENT" \
-            --name "vm-sql-$ENVIRONMENT" \
-            --command-id RunPowerShellScript \
-            --scripts 'Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString("https://chocolatey.org/install.ps1")); if (Test-Path "C:\ProgramData\chocolatey\bin\choco.exe") { Write-Output "CHOCO_OK" } else { Write-Output "CHOCO_FAIL"; exit 1 }' \
-            --output json 2>&1)
-        if echo "$choco_result" | grep -q "CHOCO_OK"; then
-            print_status "Chocolatey installed successfully"
-        else
-            print_error "Chocolatey installation failed: $choco_result"
-            exit 1
-        fi
-    fi
-
-    cd "$PROJECT_DIR"
-}
-
-# Phase 4 — Step 2: Install SQL Server Management Studio via Chocolatey
-install_ssms() {
-    print_status "Checking if SSMS is already installed on SQL server..."
-
-    cd "$PROJECT_DIR/ansible"
-
-    local ssms_check
-    ssms_check=$(ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -ScriptBlock { $ssms = Get-ChildItem "C:\Program Files (x86)\Microsoft SQL Server Management Studio*\Common7\IDE\Ssms.exe", "C:\Program Files\Microsoft SQL Server Management Studio*\Common7\IDE\Ssms.exe" -ErrorAction SilentlyContinue | Select-Object -First 1; if ($ssms) { "installed: " + $ssms.FullName } else { "not-installed" } }' \
-        -e @group_vars/windows.yml 2>&1 | grep -E "(installed:|not-installed)" | tail -1)
-
-    if echo "$ssms_check" | grep -q "installed:"; then
-        SSMS_PATH=$(echo "$ssms_check" | sed 's/installed: //' | tr -d '\r\n' | xargs)
-        print_status "SSMS already installed at: $SSMS_PATH"
-        print_status "Skipping SSMS installation via Chocolatey"
-    else
-        print_status "Installing SSMS via Azure VM Run Command (this will take 5-10 minutes)..."
-        local ssms_install_result
-        ssms_install_result=$(az vm run-command invoke \
-            --resource-group "rg-beyondtrust-$ENVIRONMENT" \
-            --name "vm-sql-$ENVIRONMENT" \
-            --command-id RunPowerShellScript \
-            --scripts 'C:\ProgramData\chocolatey\bin\choco.exe install sql-server-management-studio -y --no-progress; if ($LASTEXITCODE -eq 0) { Write-Output "SSMS_INSTALL_OK" } else { Write-Output "SSMS_INSTALL_FAIL"; exit 1 }' \
-            --output json 2>&1)
-        if echo "$ssms_install_result" | grep -q "SSMS_INSTALL_OK"; then
-            print_status "SSMS installed successfully"
-        else
-            print_error "SSMS installation failed: $ssms_install_result"
-            exit 1
-        fi
-    fi
-
-    print_status "Verifying SSMS installation path..."
-    local ssms_path_result
-    ssms_path_result=$(az vm run-command invoke \
-        --resource-group "rg-beyondtrust-$ENVIRONMENT" \
-        --name "vm-sql-$ENVIRONMENT" \
-        --command-id RunPowerShellScript \
-        --scripts '$p = Get-ChildItem "C:\Program Files (x86)\Microsoft SQL Server Management Studio*\Common7\IDE\Ssms.exe","C:\Program Files\Microsoft SQL Server Management Studio*\Common7\IDE\Ssms.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName; if ($p) { Write-Output "SSMS_PATH:$p" } else { Write-Output "SSMS_NOT_FOUND" }' \
-        --output json 2>&1)
-    local ssms_path_line
-    ssms_path_line=$(echo "$ssms_path_result" | jq -r '.value[0].message // ""' | grep "SSMS_PATH:" | head -1 | sed 's/.*SSMS_PATH://' | tr -d '\r\n' | xargs)
-    if [ -n "$ssms_path_line" ]; then
-        print_status "SSMS verified at: $ssms_path_line"
-    else
-        print_warning "Could not verify SSMS path — installation may still be valid"
-    fi
-
-    cd "$PROJECT_DIR"
-}
-
-# Phase 4 — Step 3: Install RDS roles on SQL01 (reboot deferred to end)
-install_rds_roles() {
-    print_status "Installing RDS roles on SQL server..."
-
-    cd "$PROJECT_DIR"
-
-    # Check if already installed (via Azure VM Run Command — SQL01 may not have domain auth yet)
-    local rds_check_output
-    rds_check_output=$(az vm run-command invoke \
-        --resource-group "rg-beyondtrust-$ENVIRONMENT" \
-        --name "vm-sql-$ENVIRONMENT" \
-        --command-id RunPowerShellScript \
-        --scripts 'if ((Get-WindowsFeature -Name RDS-RD-Server).InstallState -eq "Installed") { "installed" } else { "not-installed" }' \
-        --output json 2>&1)
-
-    local rds_check
-    rds_check=$(echo "$rds_check_output" | jq -r '.value[0].message // ""' | grep -o "installed\|not-installed" | tail -1)
-
-    if [ "$rds_check" = "installed" ]; then
-        print_status "RDS roles already installed, skipping..."
-    else
-        print_status "Installing RDS roles via Azure VM Run Command..."
-        RDS_INSTALL_OUTPUT=$(az vm run-command invoke \
-            --resource-group "rg-beyondtrust-$ENVIRONMENT" \
-            --name "vm-sql-$ENVIRONMENT" \
-            --command-id RunPowerShellScript \
-            --scripts '$r = Install-WindowsFeature -Name RDS-RD-Server,RDS-Connection-Broker,RDS-Web-Access -IncludeManagementTools -Restart:$false; Write-Output "Success=$($r.Success) RestartNeeded=$($r.RestartNeeded) ExitCode=$($r.ExitCode)"' \
-            --output json 2>&1)
-
-        echo "$RDS_INSTALL_OUTPUT"
-
-        local rds_msg
-        rds_msg=$(echo "$RDS_INSTALL_OUTPUT" | jq -r '.value[0].message // ""')
-        echo "$rds_msg"
-
-        if echo "$rds_msg" | grep -q "RestartNeeded=Yes" || echo "$rds_msg" | grep -q "RestartNeeded=True"; then
-            print_status "RDS roles installed — reboot needed (will be handled by the consolidated SQL01 reboot)"
-        else
-            print_status "RDS roles installed — no reboot required"
-        fi
-    fi
-
-    cd "$PROJECT_DIR"
-}
-
 # Phase 4 — Step 4: Configure CredSSP so DC can proxy RDS cmdlets to SQL01 via CredSSP
 configure_credssp_for_rds() {
     print_status "Configuring CredSSP for RDS deployment..."
@@ -2973,44 +2865,8 @@ configure_rds_deployment() {
     echo "$rds_state_result" | jq -r '.value[0].message // ""'
 
     # DC proxies New-RDSessionDeployment to SQL01 via CredSSP with explicit domain-admin
-    # credentials. This is explicit-credential auth (not delegation), so it works fine
-    # regardless of the outer Linux→DC NTLM transport.
-
-    # Check if SQL01 still has pending reboots (RDS roles sometimes need a second reboot)
-    print_status "Checking for pending reboots on SQL01..."
-    cd "$PROJECT_DIR/ansible"
-    local pending_reboot
-    pending_reboot=$(ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication Negotiate -ScriptBlock { $pending = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing" -Name RebootPending -ErrorAction SilentlyContinue) -or (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update" -Name RebootRequired -ErrorAction SilentlyContinue) -or (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue); if ($pending) { Write-Output "REBOOT_PENDING" } else { Write-Output "NO_REBOOT_PENDING" } }' \
-        -e @group_vars/windows.yml 2>&1) || true
-
-    if echo "$pending_reboot" | grep -q "REBOOT_PENDING"; then
-        print_warning "SQL01 has pending reboots — rebooting again before RDS deployment..."
-        ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-            -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication Negotiate -ScriptBlock { shutdown /r /t 5 /c "Clearing pending reboot for RDS" }' \
-            -e @group_vars/windows.yml 2>&1 || true
-
-        print_status "Waiting for SQL01 to reboot (45 seconds)..."
-        sleep 45
-
-        print_status "Polling for SQL01 to come back online..."
-        local attempt=1
-        while [ $attempt -le 30 ]; do
-            if ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-                -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Test-WSMan -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication Negotiate -ErrorAction Stop' \
-                -e @group_vars/windows.yml &>/dev/null; then
-                print_status "SQL01 is back online"
-                break
-            fi
-            sleep 10
-            ((attempt++))
-        done
-        print_status "Waiting for services to stabilize (30 seconds)..."
-        sleep 30
-    else
-        print_status "No pending reboots — proceeding with RDS deployment"
-    fi
-
+    # credentials. RDS roles were installed at Terraform time (azurerm_virtual_machine_run_command),
+    # so the consolidated reboot has already cleared any pending reboot state.
     print_status "Creating RDS deployment..."
     cd "$PROJECT_DIR/ansible"
     local rds_deploy_result
@@ -3184,27 +3040,6 @@ JSON
 # Pre-reboot steps run BEFORE the consolidated SQL01 reboot (no domain auth needed).
 # Post-reboot steps run AFTER the reboot (require domain auth on SQL01).
 
-deploy_rds_pre_reboot() {
-    echo ""
-    echo "=================================================="
-    echo "Phase 4 (pre-reboot): RDS Deployment"
-    echo "=================================================="
-
-    print_status "Step 4.1: Installing Chocolatey"
-    install_chocolatey
-    echo ""
-
-    print_status "Step 4.2: Installing/Verifying SQL Server Management Studio"
-    install_ssms
-    echo ""
-
-    print_status "Step 4.3: Installing RDS roles (reboot deferred)"
-    install_rds_roles
-    echo ""
-
-    print_status "Phase 4 pre-reboot steps complete — RDS roles will activate after SQL01 reboot"
-}
-
 deploy_rds_post_reboot() {
     echo ""
     echo "=================================================="
@@ -3228,8 +3063,7 @@ deploy_rds_post_reboot() {
     echo ""
 
     print_status "Phase 4 complete!"
-    print_status "  - Chocolatey installed on SQL01"
-    print_status "  - SSMS verified/installed on SQL01"
+    print_status "  - RDS roles installed (via Terraform)"
     print_status "  - Remote Desktop Services deployed"
     print_status "  - SSMS published as RemoteApp"
     print_status "  - BeyondTrust jump item created (tracked in state file)"
@@ -3403,11 +3237,6 @@ main() {
 
     # Phase 3b: Install BT software on DC01 + Ubuntu (parallel, needs DC + installers)
     install_beyondtrust_software
-
-    # Phase 4 pre-reboot: install RDS prerequisites before SQL01 reboot (optional)
-    if [ "$WITH_RDS" = true ]; then
-        deploy_rds_pre_reboot
-    fi
 
     # Finalize SQL01: single reboot to apply domain join (+ RDS roles if applicable),
     # then run post-reboot SQL configuration (RDP access, SQL logins)
