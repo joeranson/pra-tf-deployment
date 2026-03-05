@@ -2975,6 +2975,42 @@ configure_rds_deployment() {
     # DC proxies New-RDSessionDeployment to SQL01 via CredSSP with explicit domain-admin
     # credentials. This is explicit-credential auth (not delegation), so it works fine
     # regardless of the outer Linux→DC NTLM transport.
+
+    # Check if SQL01 still has pending reboots (RDS roles sometimes need a second reboot)
+    print_status "Checking for pending reboots on SQL01..."
+    cd "$PROJECT_DIR/ansible"
+    local pending_reboot
+    pending_reboot=$(ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
+        -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication Negotiate -ScriptBlock { $pending = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing" -Name RebootPending -ErrorAction SilentlyContinue) -or (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update" -Name RebootRequired -ErrorAction SilentlyContinue) -or (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue); if ($pending) { Write-Output "REBOOT_PENDING" } else { Write-Output "NO_REBOOT_PENDING" } }' \
+        -e @group_vars/windows.yml 2>&1) || true
+
+    if echo "$pending_reboot" | grep -q "REBOOT_PENDING"; then
+        print_warning "SQL01 has pending reboots — rebooting again before RDS deployment..."
+        ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
+            -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication Negotiate -ScriptBlock { shutdown /r /t 5 /c "Clearing pending reboot for RDS" }' \
+            -e @group_vars/windows.yml 2>&1 || true
+
+        print_status "Waiting for SQL01 to reboot (45 seconds)..."
+        sleep 45
+
+        print_status "Polling for SQL01 to come back online..."
+        local attempt=1
+        while [ $attempt -le 30 ]; do
+            if ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
+                -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); Test-WSMan -ComputerName SQL01.{{ domain_name }} -Credential $cred -Authentication Negotiate -ErrorAction Stop' \
+                -e @group_vars/windows.yml &>/dev/null; then
+                print_status "SQL01 is back online"
+                break
+            fi
+            sleep 10
+            ((attempt++))
+        done
+        print_status "Waiting for services to stabilize (30 seconds)..."
+        sleep 30
+    else
+        print_status "No pending reboots — proceeding with RDS deployment"
+    fi
+
     print_status "Creating RDS deployment..."
     cd "$PROJECT_DIR/ansible"
     local rds_deploy_result
