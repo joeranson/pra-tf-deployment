@@ -28,17 +28,11 @@ Automated deployment of a complete BeyondTrust Privileged Remote Access (PRA) de
 
 ## Prerequisites
 
-The following tools must be installed and available on your PATH before running the deployment:
+The deployment script (`deploy-infra.sh`) automatically installs all required tools on first run, including Azure CLI, Terraform, Ansible, `jq`, and `curl`. No manual installation is needed.
 
-| Tool | Minimum Version | Purpose |
-|------|----------------|---------|
-| [Azure CLI](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli) | 2.40+ | Azure resource provisioning |
-| [Terraform](https://developer.hashicorp.com/terraform/downloads) | 1.5+ | Infrastructure as code |
-| [Ansible](https://docs.ansible.com/ansible/latest/installation_guide/) | 2.12+ | Windows VM configuration |
-| `jq` | 1.6+ | JSON parsing in scripts |
-| `curl` | any | BeyondTrust API calls |
-
-You will also need:
+You will need:
+- A Linux machine running a Debian/Ubuntu-based distribution (for `apt-get` based installs)
+- `sudo` access (to install system packages)
 - An active Azure subscription
 - A BeyondTrust PRA instance with API access enabled
 
