@@ -644,6 +644,7 @@ resource "azurerm_windows_virtual_machine" "dc" {
   admin_password      = var.admin_password
   secure_boot_enabled = true
   vtpm_enabled        = true
+  patch_mode          = "AutomaticByPlatform"
 
   network_interface_ids = [azurerm_network_interface.dc.id]
 
