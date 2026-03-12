@@ -869,7 +869,8 @@ inventory = ./inventory/hosts.yml
 host_key_checking = False
 timeout = 30
 callbacks_enabled = profile_tasks
-stdout_callback = yaml
+stdout_callback = ansible.builtin.default
+result_format = yaml
 deprecation_warnings = False
 
 [winrm]
