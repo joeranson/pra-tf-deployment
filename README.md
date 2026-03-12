@@ -45,6 +45,7 @@ You will need:
 ```bash
 git clone <repository-url>
 cd pra-tf-deployment
+chmod +x ./deploy-infra.sh
 ```
 
 ### Step 2 — Generate the configuration file
