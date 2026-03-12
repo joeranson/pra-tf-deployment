@@ -290,7 +290,7 @@ install_prerequisites() {
 
     # Install Ansible collections (idempotent by default)
     print_status "Ensuring Ansible collections are installed..."
-    ansible-galaxy collection install ansible.windows community.windows
+    ansible-galaxy collection install ansible.windows community.windows microsoft.ad
 }
 
 # Phase 1: Deploy Azure Infrastructure
@@ -956,11 +956,10 @@ EOF
       changed_when: false
     
     - name: Create Domain
-      ansible.windows.win_domain:
+      microsoft.ad.domain:
         dns_domain_name: "{{ domain_name }}"
         domain_netbios_name: "{{ domain_netbios_name }}"
         safe_mode_password: "{{ safe_mode_password }}"
-        state: domain_controller
       register: domain_install
       when: domain_role.stdout|int < 4  # 4 or 5 means it's already a DC
     
