@@ -340,11 +340,11 @@ deploy_azure_infrastructure() {
     
     cat > terraform/main.tf << 'EOF'
 terraform {
-  required_version = ">= 1.0"
+  required_version = ">= 1.5"
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = "4.34.0"
+      version = "4.63.0"
     }
   }
 }
@@ -644,6 +644,7 @@ resource "azurerm_windows_virtual_machine" "dc" {
   admin_password      = var.admin_password
   secure_boot_enabled = true
   vtpm_enabled        = true
+  patch_mode          = "AutomaticByPlatform"
 
   network_interface_ids = [azurerm_network_interface.dc.id]
 
@@ -655,7 +656,7 @@ resource "azurerm_windows_virtual_machine" "dc" {
   source_image_reference {
     publisher = "MicrosoftWindowsServer"
     offer     = "WindowsServer"
-    sku       = "2022-datacenter-azure-edition"
+    sku       = "2025-datacenter-azure-edition"
     version   = "latest"
   }
 
@@ -689,7 +690,7 @@ resource "azurerm_windows_virtual_machine" "sql" {
 
   source_image_reference {
     publisher = "MicrosoftSQLServer"
-    offer     = "sql2019-ws2022"
+    offer     = "sql2022-ws2022"
     sku       = "sqldev-gen2"
     version   = "latest"
   }
@@ -1478,11 +1479,11 @@ create_beyondtrust_terraform_config() {
     
     cat > beyondtrust/terraform/versions.tf << 'EOF'
 terraform {
-  required_version = ">= 1.0"
+  required_version = ">= 1.5"
   required_providers {
     sra = {
       source  = "BeyondTrust/sra"
-      version = "~> 1.0"
+      version = "~> 1.3"
     }
   }
 }

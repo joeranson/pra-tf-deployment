@@ -9,7 +9,7 @@ Automated deployment of a complete BeyondTrust Privileged Remote Access (PRA) de
 - **Azure Infrastructure**
   - Resource group, virtual network, and three subnets
   - Domain Controller VM (DC01) — Windows Server with Active Directory (public IP)
-  - SQL Server VM (SQL01) — Windows Server with SQL Server 2019 Developer Edition
+  - SQL Server VM (SQL01) — Windows Server with SQL Server 2022 Developer Edition
   - Ubuntu VM (Ubuntu01) — Ubuntu 24.04 LTS with BeyondTrust Jump Client (public IP)
   - Network security groups with appropriate firewall rules
 
@@ -33,7 +33,7 @@ The following tools must be installed and available on your PATH before running 
 | Tool | Minimum Version | Purpose |
 |------|----------------|---------|
 | [Azure CLI](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli) | 2.40+ | Azure resource provisioning |
-| [Terraform](https://developer.hashicorp.com/terraform/downloads) | 1.0+ | Infrastructure as code |
+| [Terraform](https://developer.hashicorp.com/terraform/downloads) | 1.5+ | Infrastructure as code |
 | [Ansible](https://docs.ansible.com/ansible/latest/installation_guide/) | 2.12+ | Windows VM configuration |
 | `jq` | 1.6+ | JSON parsing in scripts |
 | `curl` | any | BeyondTrust API calls |
@@ -181,7 +181,7 @@ Azure Virtual Network (10.0.0.0/16)
 ├── Subnet 1 (10.0.1.0/24)
 │   └── DC01 (10.0.1.10) — Domain Controller + Jumpoint  [public IP]
 ├── Subnet 2 (10.0.2.0/24)
-│   └── SQL01 (10.0.2.10) — SQL Server 2019
+│   └── SQL01 (10.0.2.10) — SQL Server 2022
 └── Subnet 3 (10.0.3.0/24)
     └── Ubuntu01 (10.0.3.10) — Ubuntu 24.04 + Jump Client  [public IP]
 
