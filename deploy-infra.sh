@@ -2785,8 +2785,26 @@ install_rds_roles() {
                 exit 1
             fi
 
-            print_status "Waiting for services to stabilize (30 seconds)..."
-            sleep 30
+            print_status "Waiting for services to stabilize (60 seconds)..."
+            sleep 60
+
+            # Verify feature subsystem is ready (not just WinRM)
+            print_status "Verifying SQL server feature subsystem is ready (max 2 min)..."
+            local feat_ready=false
+            for feat_attempt in $(seq 1 12); do
+                if ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
+                    -a '$password = ConvertTo-SecureString "{{ ansible_password }}" -AsPlainText -Force; $cred = New-Object PSCredential("{{ domain_netbios_name }}\{{ ansible_user }}", $password); $f = Invoke-Command -ComputerName SQL01.{{ domain_name }} -Credential $cred -ScriptBlock { (Get-WindowsFeature -Name RDS-RD-Server).InstallState }; if ($f -eq "Installed") { Write-Output "FEATURE_READY" } else { Write-Output "FEATURE_NOT_READY" }' \
+                    -e @group_vars/windows.yml 2>/dev/null | grep -q "FEATURE_READY"; then
+                    print_status "SQL server feature subsystem is ready (attempt $feat_attempt/12)"
+                    feat_ready=true
+                    break
+                fi
+                print_warning "Feature subsystem not ready yet (attempt $feat_attempt/12), retrying in 10s..."
+                sleep 10
+            done
+            if [ "$feat_ready" = false ]; then
+                print_warning "Feature subsystem did not confirm ready within 2 minutes — proceeding anyway"
+            fi
         else
             print_status "No reboot required after RDS installation"
         fi
@@ -2801,10 +2819,23 @@ configure_credssp_for_rds() {
     cd "$PROJECT_DIR/ansible"
 
     # RSAT-RDS-Tools gives DC the RemoteDesktop PowerShell module used for RDS cmdlets
+    # Retry up to 3 times — feature discovery can timeout transiently after domain changes
     print_status "Installing RDS management tools on DC..."
-    ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
-        -a 'Install-WindowsFeature RSAT-RDS-Tools -IncludeManagementTools' \
-        -e @group_vars/windows.yml
+    local rds_tools_installed=false
+    for rds_tools_attempt in $(seq 1 3); do
+        if ansible dc -i inventory/hosts.yml -m ansible.windows.win_shell \
+            -a 'Install-WindowsFeature RSAT-RDS-Tools -IncludeManagementTools' \
+            -e @group_vars/windows.yml; then
+            rds_tools_installed=true
+            break
+        fi
+        print_warning "Install-WindowsFeature RSAT-RDS-Tools failed (attempt $rds_tools_attempt/3), retrying in 30s..."
+        sleep 30
+    done
+    if [ "$rds_tools_installed" = false ]; then
+        print_error "Failed to install RSAT-RDS-Tools after 3 attempts"
+        exit 1
+    fi
 
     # Enable CredSSP Server on SQL01. DC connects to SQL01 via Kerberos (domain-joined)
     # with explicit credentials to set this up — no CredSSP chicken-and-egg issue.
