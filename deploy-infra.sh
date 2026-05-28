@@ -703,16 +703,6 @@ resource "azurerm_windows_virtual_machine" "sql" {
 }
 
 
-# SQL VM Configuration
-resource "azurerm_mssql_virtual_machine" "sql" {
-  virtual_machine_id = azurerm_windows_virtual_machine.sql.id
-  sql_license_type   = "PAYG"
-
-  sql_connectivity_type = "PRIVATE"
-  sql_connectivity_port = 1433
-  # depends_on is implicit via virtual_machine_id reference; no explicit declaration needed
-}
-
 # Ubuntu Linux VM
 resource "azurerm_linux_virtual_machine" "ubuntu" {
   name                            = "vm-ubuntu-${var.environment}"
