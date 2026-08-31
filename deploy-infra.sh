@@ -183,6 +183,15 @@ RESOURCE_PREFIX="Demo_"
 # Select the group you want demo accounts assigned to and note its ID
 VAULT_ACCOUNT_GROUP_ID="4"
 
+# Group Policy ID that the created asset (Jump) groups are assigned to
+# Find this in the BeyondTrust console: Users & Security -> Group Policies
+# The default of 2 is the built-in "administrators" policy
+GROUP_POLICY_ID="2"
+
+# Jump Item Role granted to the group policy on those asset groups
+# Find this in the BeyondTrust console: Jump -> Jump Item Roles
+JUMP_ITEM_ROLE_ID="2"
+
 # Optional: Override default BeyondTrust resource names
 # JUMP_GROUP_DEMO="Demo Servers"
 # JUMP_GROUP_DC="Domain Controllers"
@@ -235,6 +244,8 @@ validate_config() {
     JUMP_GROUP_DC="${RESOURCE_PREFIX}${JUMP_GROUP_DC:-Domain Controllers}"
     JUMPOINT_NAME="${RESOURCE_PREFIX}${JUMPOINT_NAME:-DC01_Jumpoint}"
     VAULT_ACCOUNT_GROUP_ID="${VAULT_ACCOUNT_GROUP_ID:-4}"
+    GROUP_POLICY_ID="${GROUP_POLICY_ID:-2}"
+    JUMP_ITEM_ROLE_ID="${JUMP_ITEM_ROLE_ID:-2}"
     LINUX_ADMIN_USERNAME="${LINUX_ADMIN_USERNAME:-linuxadmin}"
     LINUX_ADMIN_PASSWORD="${LINUX_ADMIN_PASSWORD:-UbuntuPass123!}"
     JUMP_GROUP_LINUX="${RESOURCE_PREFIX}${JUMP_GROUP_LINUX:-Linux Servers}"
@@ -244,7 +255,8 @@ validate_config() {
     export DOMAIN_NAME DOMAIN_NETBIOS_NAME ADMIN_USERNAME ADMIN_PASSWORD
     export JUMP_GROUP_DEMO JUMP_GROUP_DC JUMPOINT_NAME VAULT_ACCOUNT_GROUP_ID
     export LINUX_ADMIN_USERNAME LINUX_ADMIN_PASSWORD JUMP_GROUP_LINUX
-    
+    export GROUP_POLICY_ID JUMP_ITEM_ROLE_ID
+
     print_status "Configuration validated successfully"
 }
 
@@ -1268,6 +1280,7 @@ deploy_beyondtrust() {
     export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET RESOURCE_PREFIX APPROVER_EMAIL
     export JUMP_GROUP_DEMO JUMP_GROUP_DC JUMPOINT_NAME ADMIN_USERNAME ADMIN_PASSWORD DOMAIN_NAME
     export VAULT_ACCOUNT_GROUP_ID
+    export GROUP_POLICY_ID JUMP_ITEM_ROLE_ID
 
     # Update state
     update_metadata "beyondtrust_instance" "$BT_API_HOST"
@@ -1279,6 +1292,7 @@ deploy_beyondtrust() {
     create_beyondtrust_state_helper
     create_beyondtrust_run_wrapper  # NEW: Create wrapper script
     create_beyondtrust_policy_script
+    create_beyondtrust_group_policy_script
     create_beyondtrust_installer_script
     create_beyondtrust_jump_items_script
     create_beyondtrust_vault_script
@@ -1304,17 +1318,21 @@ deploy_beyondtrust() {
     add_resource "jumpoint" "$(cat jumpoint_id.txt)" "$JUMPOINT_NAME" '{"platform": "windows-x86", "managed_by": "terraform"}'
     popd > /dev/null
 
-    # Step 2: Create policies via API (using wrapper)
+    # Step 2: Assign asset groups to the group policy (using wrapper)
+    print_status "Assigning asset groups to group policy..."
+    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-group-policy.sh)
+
+    # Step 3: Create policies via API (using wrapper)
     print_status "Creating jump policies..."
     (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh create-policies.sh)
 
-    # Step 3: Download installers (using wrapper)
+    # Step 4: Download installers (using wrapper)
     print_status "Downloading installers..."
     (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh download-installers.sh) || {
         print_error "Failed to download installers. Check your BeyondTrust API credentials and network connectivity."
     }
 
-    # Step 4: Install software via Ansible
+    # Step 5: Install software via Ansible
     print_status "Installing BeyondTrust software on DC01..."
     pushd "$PROJECT_DIR/ansible" > /dev/null
 
@@ -1411,11 +1429,11 @@ journalctl --no-pager -n 30 2>/dev/null | grep -iE 'scc|bomgar|beyond|jumpclient
         print_warning "  Missing: ${key_info_file} or ${installer_id_file}"
     fi
 
-    # Step 5: Configure jump items (using wrapper)
+    # Step 6: Configure jump items (using wrapper)
     print_status "Configuring jump items..."
     (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-jump-items.sh)
 
-    # Step 6: Configure vault (using wrapper)
+    # Step 7: Configure vault (using wrapper)
     print_status "Configuring vault accounts..."
     (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-vault.sh)
 
@@ -1445,8 +1463,11 @@ source "$CONFIG_FILE"
 export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET APPROVER_EMAIL RESOURCE_PREFIX
 export DOMAIN_NAME DOMAIN_NETBIOS_NAME ADMIN_USERNAME ADMIN_PASSWORD
 export VAULT_ACCOUNT_GROUP_ID="${VAULT_ACCOUNT_GROUP_ID:-4}"
+export GROUP_POLICY_ID="${GROUP_POLICY_ID:-2}"
+export JUMP_ITEM_ROLE_ID="${JUMP_ITEM_ROLE_ID:-2}"
 export JUMP_GROUP_DEMO="${RESOURCE_PREFIX}Demo Servers"
 export JUMP_GROUP_DC="${RESOURCE_PREFIX}Domain Controllers"
+export JUMP_GROUP_LINUX="${RESOURCE_PREFIX}${JUMP_GROUP_LINUX:-Linux Servers}"
 export JUMPOINT_NAME="${RESOURCE_PREFIX}DC01_Jumpoint"
 
 # Run the requested script
@@ -1739,6 +1760,98 @@ echo "Jump policies created successfully"
 EOF
     
     chmod +x beyondtrust/scripts/create-policies.sh
+}
+
+create_beyondtrust_group_policy_script() {
+    print_status "Creating group policy assignment script..."
+
+    cat > beyondtrust/scripts/configure-group-policy.sh << 'EOF'
+#!/bin/bash
+# Assign the asset (Jump) groups created by Terraform to an existing group policy
+
+source "$(dirname "$0")/bt-api.sh"
+source "$(dirname "$0")/state-helper.sh"
+
+GROUP_POLICY_ID="${GROUP_POLICY_ID:-2}"
+JUMP_ITEM_ROLE_ID="${JUMP_ITEM_ROLE_ID:-2}"
+TF_DIR="$(dirname "$0")/../terraform"
+
+# Confirm the target group policy exists before attempting any assignment.
+# A bad ID here would otherwise fail silently three times over.
+verify_group_policy() {
+    local response policy_name
+    response=$(api_call "GET" "/group-policy/$GROUP_POLICY_ID" "")
+
+    policy_name=$(echo "$response" | jq -r '.name // empty')
+    if [ -z "$policy_name" ]; then
+        echo "ERROR: Group policy $GROUP_POLICY_ID was not found on $BT_API_HOST"
+        echo "       Set GROUP_POLICY_ID in config.env to a policy listed under"
+        echo "       Users & Security -> Group Policies in the BeyondTrust console."
+        echo "       API response: $response"
+        return 1
+    fi
+
+    echo "Assigning asset groups to group policy $GROUP_POLICY_ID ($policy_name)"
+}
+
+# Add a single Jump Group to the group policy
+assign_jump_group() {
+    local jump_group_id="$1"
+    local label="$2"
+
+    if [ -z "$jump_group_id" ] || [ "$jump_group_id" = "null" ]; then
+        echo "  Skipping $label - no Jump Group ID available"
+        return
+    fi
+
+    # Skip if already assigned so re-runs stay safe
+    local existing
+    existing=$(api_call "GET" "/group-policy/$GROUP_POLICY_ID/jump-group/$jump_group_id" "")
+    if [ "$(echo "$existing" | jq -r '.jump_group_id // empty')" = "$jump_group_id" ]; then
+        echo "  $label (ID: $jump_group_id) already assigned"
+        return
+    fi
+
+    local assignment_data
+    assignment_data=$(cat <<JSON
+{
+    "jump_group_id": $jump_group_id,
+    "jump_group_type": "shared",
+    "jump_item_role_id": $JUMP_ITEM_ROLE_ID
+}
+JSON
+)
+
+    local response
+    response=$(api_call "POST" "/group-policy/$GROUP_POLICY_ID/jump-group" "$assignment_data")
+
+    if [ "$(echo "$response" | jq -r '.jump_group_id // empty')" = "$jump_group_id" ]; then
+        add_bt_resource "group_policy_jump_group" "$jump_group_id" "$label" \
+            '{"group_policy_id": "'"$GROUP_POLICY_ID"'", "jump_item_role_id": "'"$JUMP_ITEM_ROLE_ID"'"}'
+        echo "  Assigned $label (ID: $jump_group_id) with jump item role $JUMP_ITEM_ROLE_ID"
+    else
+        echo "  ERROR: Failed to assign $label (ID: $jump_group_id)"
+        echo "         API response: $response"
+    fi
+}
+
+# Read an ID written by 'terraform output' during deployment
+read_group_id() {
+    local file="$TF_DIR/$1"
+    [ -f "$file" ] && tr -d '[:space:]' < "$file"
+}
+
+# Main execution
+verify_group_policy || exit 1
+
+assign_jump_group "$(read_group_id demo_group_id.txt)" "${JUMP_GROUP_DEMO:-Demo Servers}"
+assign_jump_group "$(read_group_id dc_group_id.txt)" "${JUMP_GROUP_DC:-Domain Controllers}"
+assign_jump_group "$(read_group_id linux_group_id.txt)" "${JUMP_GROUP_LINUX:-Linux Servers}"
+
+echo "Asset group assignment completed"
+EOF
+
+    chmod +x beyondtrust/scripts/configure-group-policy.sh
 }
 
 create_beyondtrust_installer_script() {
@@ -2413,6 +2526,27 @@ cleanup_policies() {
     fi
 }
 
+# Remove asset (Jump) group assignments from the group policy.
+# Must run before terraform destroy removes the Jump Groups themselves.
+cleanup_group_policy_assignments() {
+    echo "Cleaning up group policy asset group assignments..."
+
+    local assignments
+    assignments=$(jq -r '.resources["group_policy_jump_group"][]? | "\(.group_policy_id) \(.id)"' "$STATE_FILE" 2>/dev/null)
+
+    if [ -n "$assignments" ]; then
+        echo "$assignments" | while read -r gp_id jg_id; do
+            if [ -n "$gp_id" ] && [ -n "$jg_id" ]; then
+                echo "  Removing jump group $jg_id from group policy $gp_id"
+                api_call "DELETE" "/group-policy/$gp_id/jump-group/$jg_id" "" \
+                    || echo "    Failed to remove jump group $jg_id from group policy $gp_id"
+            fi
+        done
+    else
+        echo "  No group policy assignments found in state file"
+    fi
+}
+
 # Display state file summary before cleanup
 show_cleanup_summary() {
     echo "Resources to be cleaned up:"
@@ -2443,6 +2577,7 @@ show_cleanup_summary
 echo ""
 
 # Perform cleanup
+cleanup_group_policy_assignments
 cleanup_jump_items
 cleanup_vault_accounts
 cleanup_jump_client_installers
@@ -3210,6 +3345,7 @@ main() {
     echo "BeyondTrust Resources:"
     echo "  Instance: $BT_API_HOST"
     echo "  Jump Groups: $JUMP_GROUP_DEMO, $JUMP_GROUP_DC, $JUMP_GROUP_LINUX"
+    echo "  Group Policy: ID $GROUP_POLICY_ID - all three asset groups assigned with jump item role $JUMP_ITEM_ROLE_ID"
     echo "  Jumpoint: $JUMPOINT_NAME on DC01"
     echo "  Jump Items: RDP access to DC01 and SQL01, MSSQL tunnel to SQL01, SSH Shell Jump to Ubuntu01"
     echo "  Vault Accounts (Windows): $DOMAIN_NETBIOS_NAME\\testadmin, $DOMAIN_NETBIOS_NAME\\jsmith, $DOMAIN_NETBIOS_NAME\\mjohnson, $DOMAIN_NETBIOS_NAME\\bdavis"

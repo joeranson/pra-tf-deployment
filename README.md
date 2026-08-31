@@ -15,7 +15,8 @@ Automated deployment of a complete BeyondTrust Privileged Remote Access (PRA) de
 
 - **BeyondTrust PRA Configuration**
   - Jumpoint installed on DC01
-  - Jump groups for demo servers, domain controllers, and Linux servers
+  - Jump groups (asset groups) for demo servers, domain controllers, and Linux servers
+  - All three asset groups assigned to a group policy (default: `administrators`, ID 2) so its members inherit access
   - Jump items: SQL Server RDP, DC01 RDP, IIS Web Portal, MSSQL protocol tunnel, Ubuntu01 SSH Shell Jump, Ubuntu01 Jump Client
   - Jump policies: approval-required (SQL + Linux) and direct access (DC)
   - Vault accounts for domain admin, demo users (jsmith, mjohnson, bdavis), and Ubuntu local admin (linuxadmin)
@@ -122,6 +123,8 @@ All variables live in `~/beyondtrust-demo/config.env`.
 | `APPROVER_EMAIL` | _(empty)_ | Yes | Email for approval workflow notifications |
 | `RESOURCE_PREFIX` | `Demo_` | No | Prefix applied to all created BeyondTrust resources |
 | `VAULT_ACCOUNT_GROUP_ID` | `4` | Yes | Numeric ID of the vault account group that demo accounts are assigned to. Find it in BeyondTrust console → Vault → Account Groups. |
+| `GROUP_POLICY_ID` | `2` | No | Numeric ID of the group policy the asset (jump) groups are assigned to. `2` is the built-in `administrators` policy. Find it in BeyondTrust console → Users & Security → Group Policies. |
+| `JUMP_ITEM_ROLE_ID` | `2` | No | Numeric ID of the jump item role granted to that group policy on the asset groups. Find it in BeyondTrust console → Jump → Jump Item Roles. |
 | `JUMP_GROUP_DEMO` | `Demo Servers` | No | Name of the jump group for demo servers |
 | `JUMP_GROUP_DC` | `Domain Controllers` | No | Name of the jump group for domain controllers |
 | `JUMP_GROUP_LINUX` | `Linux Servers` | No | Name of the jump group for Linux servers |
@@ -182,10 +185,12 @@ Azure Virtual Network (10.0.0.0/16)
 
 BeyondTrust PRA
 ├── Jumpoint (on DC01) — proxies connections to internal resources
-├── Jump Groups
+├── Jump Groups (Asset Groups)
 │   ├── Demo Servers       — SQL01 jump items
 │   ├── Domain Controllers — DC01 jump items
 │   └── Linux Servers      — Ubuntu01 jump items
+├── Group Policy (ID 2 — administrators)
+│   └── all three asset groups assigned, jump item role 2
 ├── Jump Items
 │   ├── SQL01 RDP          — approval-required policy
 │   ├── SQL01 IIS Web      — approval-required policy
@@ -209,6 +214,13 @@ Verify `BT_CLIENT_ID` and `BT_CLIENT_SECRET` are correct and that the API accoun
 
 **Vault accounts fail to create**
 Confirm that `VAULT_ACCOUNT_GROUP_ID` matches an existing group in your BeyondTrust instance. The default value of `4` may not exist in your environment.
+
+**Asset groups are not assigned to the group policy**
+The group policy step fails fast if `GROUP_POLICY_ID` does not exist on your instance. Confirm the ID under Configuration → Users & Security → Group Policies. If the policy is found but the assignment is rejected, `JUMP_ITEM_ROLE_ID` is likely wrong — check Jump → Jump Item Roles for a valid numeric ID. Both values live in `config.env`; re-run the step on its own with:
+
+```bash
+cd ~/beyondtrust-demo/beyondtrust/scripts && ./run-with-config.sh configure-group-policy.sh
+```
 
 **Ansible tasks time out connecting to VMs**
 The VMs need a few minutes after provisioning before WinRM is available. The script includes retry logic, but in some regions VMs start more slowly. Re-running the script is safe — it uses state tracking to skip already-completed steps.
