@@ -6,11 +6,29 @@
 # removed unnecessary data disk, reduced OS disk sizes, and Basic SKU public IP
 #
 # Usage:
-#   ./deploy-infra.sh                  # First run creates config, second run deploys
-#   ./deploy-infra.sh --cleanup        # Remove only resources created by this script
-#   ./deploy-infra.sh --with-rds       # Also deploy RDS roles and publish SSMS RemoteApp
+#   ./deploy-infra.sh                          # First run creates config, second run deploys
+#   ./deploy-infra.sh --cleanup                # Remove only resources created by this script
+#   ./deploy-infra.sh --with-rds               # Also deploy RDS roles and publish SSMS RemoteApp
+#   ./deploy-infra.sh --group-policy-only      # Only assign asset groups to the group policy
+#   ./deploy-infra.sh --group-policy-only --list  # List group policies and jump item roles
 
 set -e
+
+usage() {
+    cat <<USAGE
+Usage: ./deploy-infra.sh [FLAG]
+
+  (no flag)                        Create config on first run, deploy on subsequent runs
+  --cleanup                        Remove only the resources created by this script
+  --with-rds                       Also deploy RDS roles and publish SSMS as a RemoteApp
+  --group-policy-only              Assign the asset (Jump) groups to the group policy only.
+                                   Requires an existing deployment; skips Azure, Terraform
+                                   and Ansible. Safe to re-run - the assignment is idempotent.
+  --group-policy-only --list       Show this instance's group policies, jump item roles and
+                                   current assignments without changing anything
+  --help, -h                       Show this message
+USAGE
+}
 
 # Check for cleanup flag
 CLEANUP_MODE=false
@@ -22,6 +40,28 @@ fi
 WITH_RDS=false
 if [ "$1" = "--with-rds" ]; then
     WITH_RDS=true
+fi
+
+# Check for --group-policy-only flag. $2 is captured so that --list can be passed
+# through to the generated script (main is invoked without "$@").
+GROUP_POLICY_ONLY=false
+GROUP_POLICY_ARGS=""
+if [ "$1" = "--group-policy-only" ]; then
+    GROUP_POLICY_ONLY=true
+    GROUP_POLICY_ARGS="$2"
+fi
+
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    usage
+    exit 0
+fi
+
+# Reject anything unrecognised rather than silently starting a full deployment
+if [ -n "$1" ] && [ "$CLEANUP_MODE" = false ] && [ "$WITH_RDS" = false ] && [ "$GROUP_POLICY_ONLY" = false ]; then
+    echo "Unknown option: $1"
+    echo ""
+    usage
+    exit 1
 fi
 
 # Variables
@@ -168,7 +208,7 @@ SAFE_MODE_PASSWORD="SafeModePass123!"
 BT_API_HOST=""
 
 # API Credentials (get from BeyondTrust console -> Configuration -> API Accounts)
-# Required permissions: Configuration API, Manage Vault Accounts
+# Required permissions: Configuration API, Manage Vault Accounts, Group Policy
 BT_CLIENT_ID=""
 BT_CLIENT_SECRET=""
 
@@ -185,12 +225,15 @@ VAULT_ACCOUNT_GROUP_ID="4"
 
 # Group Policy ID that the created asset (Jump) groups are assigned to
 # Find this in the BeyondTrust console: Users & Security -> Group Policies
-# The default of 2 is the built-in "administrators" policy
+# The default of 2 is the built-in "Administrator" policy
 GROUP_POLICY_ID="2"
 
 # Jump Item Role granted to the group policy on those asset groups
 # Find this in the BeyondTrust console: Jump -> Jump Item Roles
 JUMP_ITEM_ROLE_ID="2"
+
+# To see the group policies and jump item roles on your instance, run:
+#   ./deploy-infra.sh --group-policy-only --list"
 
 # Optional: Override default BeyondTrust resource names
 # JUMP_GROUP_DEMO="Demo Servers"
@@ -1269,6 +1312,26 @@ EOF
     popd > /dev/null
 }
 
+# Assign asset groups to the group policy against an already-deployed environment.
+# Skips Azure, Terraform and Ansible entirely - see --group-policy-only.
+run_group_policy_assignment_only() {
+    print_status "Assigning asset groups to group policy (existing deployment)..."
+
+    if [ ! -f "$STATE_FILE" ]; then
+        print_error "No deployment state found at $STATE_FILE. Run ./deploy-infra.sh first."
+    fi
+
+    cd "$PROJECT_DIR"
+
+    # Regenerate the scripts this step needs so they match the current source
+    create_beyondtrust_api_helper
+    create_beyondtrust_state_helper
+    create_beyondtrust_run_wrapper
+    create_beyondtrust_group_policy_script
+
+    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-group-policy.sh $GROUP_POLICY_ARGS)
+}
+
 # Phase 3: BeyondTrust Integration
 deploy_beyondtrust() {
     print_status "Phase 3: Deploying BeyondTrust PRA integration..."
@@ -1320,7 +1383,11 @@ deploy_beyondtrust() {
 
     # Step 2: Assign asset groups to the group policy (using wrapper)
     print_status "Assigning asset groups to group policy..."
-    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-group-policy.sh)
+    GROUP_POLICY_ASSIGNED=true
+    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-group-policy.sh) || {
+        GROUP_POLICY_ASSIGNED=false
+        print_warning "Asset group assignment failed - see output above. Continuing deployment."
+    }
 
     # Step 3: Create policies via API (using wrapper)
     print_status "Creating jump policies..."
@@ -1467,7 +1534,7 @@ export GROUP_POLICY_ID="${GROUP_POLICY_ID:-2}"
 export JUMP_ITEM_ROLE_ID="${JUMP_ITEM_ROLE_ID:-2}"
 export JUMP_GROUP_DEMO="${RESOURCE_PREFIX}Demo Servers"
 export JUMP_GROUP_DC="${RESOURCE_PREFIX}Domain Controllers"
-export JUMP_GROUP_LINUX="${RESOURCE_PREFIX}${JUMP_GROUP_LINUX:-Linux Servers}"
+export JUMP_GROUP_LINUX="${RESOURCE_PREFIX}Linux Servers"
 export JUMPOINT_NAME="${RESOURCE_PREFIX}DC01_Jumpoint"
 
 # Run the requested script
@@ -1602,6 +1669,27 @@ api_call() {
     token=$(get_api_token) || return 1
 
     local args=(-s -X "$method" "$BT_API_HOST/api/config/v1$endpoint" \
+        -H "Authorization: Bearer $token" \
+        -H "Accept: application/json")
+
+    if [ -n "$data" ]; then
+        args+=(-H "Content-Type: application/json" -d "$data")
+    fi
+
+    curl "${args[@]}"
+}
+
+# As api_call, but appends the HTTP status code as a final line so callers can
+# distinguish "rejected" from "succeeded with an unexpected body shape".
+api_call_status() {
+    local method="$1"
+    local endpoint="$2"
+    local data="$3"
+
+    local token
+    token=$(get_api_token) || return 1
+
+    local args=(-s -w '\n%{http_code}' -X "$method" "$BT_API_HOST/api/config/v1$endpoint" \
         -H "Authorization: Bearer $token" \
         -H "Accept: application/json")
 
@@ -1768,6 +1856,11 @@ create_beyondtrust_group_policy_script() {
     cat > beyondtrust/scripts/configure-group-policy.sh << 'EOF'
 #!/bin/bash
 # Assign the asset (Jump) groups created by Terraform to an existing group policy
+#
+# Usage:
+#   ./configure-group-policy.sh          Assign the asset groups (idempotent)
+#   ./configure-group-policy.sh --list   Show policies, jump item roles and current
+#                                        assignments without changing anything
 
 source "$(dirname "$0")/bt-api.sh"
 source "$(dirname "$0")/state-helper.sh"
@@ -1776,77 +1869,157 @@ GROUP_POLICY_ID="${GROUP_POLICY_ID:-2}"
 JUMP_ITEM_ROLE_ID="${JUMP_ITEM_ROLE_ID:-2}"
 TF_DIR="$(dirname "$0")/../terraform"
 
-# Confirm the target group policy exists before attempting any assignment.
-# A bad ID here would otherwise fail silently three times over.
-verify_group_policy() {
-    local response policy_name
-    response=$(api_call "GET" "/group-policy/$GROUP_POLICY_ID" "")
+FAILURES=0
 
-    policy_name=$(echo "$response" | jq -r '.name // empty')
-    if [ -z "$policy_name" ]; then
-        echo "ERROR: Group policy $GROUP_POLICY_ID was not found on $BT_API_HOST"
-        echo "       Set GROUP_POLICY_ID in config.env to a policy listed under"
-        echo "       Users & Security -> Group Policies in the BeyondTrust console."
-        echo "       API response: $response"
+# Split the "body + trailing status line" produced by api_call_status
+http_body() { echo "$1" | sed '$d'; }
+http_code() { echo "$1" | tail -n1; }
+
+# Turn a status code into an explanation worth acting on
+explain_failure() {
+    case "$1" in
+        401) echo "         The API credentials were rejected. Check BT_CLIENT_ID / BT_CLIENT_SECRET." ;;
+        403) echo "         The API account is not permitted to manage group policies. In the console," ;
+             echo "         open Configuration -> API Accounts and grant it Group Policy access." ;;
+        404) echo "         The endpoint or object does not exist. Check GROUP_POLICY_ID in config.env." ;;
+    esac
+}
+
+# Print the instance's group policies, jump item roles and current assignments
+list_options() {
+    local response
+
+    echo "Group policies (set GROUP_POLICY_ID in config.env):"
+    response=$(api_call "GET" "/group-policy" "")
+    echo "$response" | jq -r '.[]? | "  \(.id): \(.name)"' 2>/dev/null \
+        || echo "  Could not list group policies: $response"
+
+    echo ""
+    echo "Jump item roles (set JUMP_ITEM_ROLE_ID in config.env):"
+    response=$(api_call "GET" "/jump-item-role" "")
+    echo "$response" | jq -r '.[]? | "  \(.id): \(.name)"' 2>/dev/null \
+        || echo "  Could not list jump item roles: $response"
+
+    echo ""
+    echo "Asset groups currently assigned to group policy $GROUP_POLICY_ID:"
+    response=$(api_call "GET" "/group-policy/$GROUP_POLICY_ID/jump-group" "")
+    if [ "$(echo "$response" | jq -r 'if type == "array" then length else 0 end' 2>/dev/null)" = "0" ]; then
+        echo "  (none)"
+    else
+        echo "$response" | jq -r '.[]? | "  jump_group_id \(.jump_group_id), jump_item_role_id \(.jump_item_role_id // "none")"'
+    fi
+}
+
+# Confirm the target group policy exists before attempting any assignment.
+# A bad ID here would otherwise fail once per asset group with the same opaque error.
+verify_group_policy() {
+    local response body code policy_name
+    response=$(api_call_status "GET" "/group-policy/$GROUP_POLICY_ID" "")
+    body=$(http_body "$response")
+    code=$(http_code "$response")
+
+    policy_name=$(echo "$body" | jq -r '.name // empty' 2>/dev/null)
+    if [ "$code" -lt 200 ] || [ "$code" -ge 300 ] || [ -z "$policy_name" ]; then
+        echo "ERROR: Could not read group policy $GROUP_POLICY_ID from $BT_API_HOST (HTTP $code)"
+        echo "       API response: $body"
+        explain_failure "$code"
+        echo "       Run with --list to see the group policies on this instance."
         return 1
     fi
 
     echo "Assigning asset groups to group policy $GROUP_POLICY_ID ($policy_name)"
 }
 
-# Add a single Jump Group to the group policy
+# Add a single asset (Jump) group to the group policy
 assign_jump_group() {
     local jump_group_id="$1"
     local label="$2"
 
     if [ -z "$jump_group_id" ] || [ "$jump_group_id" = "null" ]; then
-        echo "  Skipping $label - no Jump Group ID available"
+        echo "  ERROR: No Jump Group ID available for $label - cannot assign"
+        FAILURES=$((FAILURES + 1))
         return
     fi
 
-    # Skip if already assigned so re-runs stay safe
-    local existing
-    existing=$(api_call "GET" "/group-policy/$GROUP_POLICY_ID/jump-group/$jump_group_id" "")
-    if [ "$(echo "$existing" | jq -r '.jump_group_id // empty')" = "$jump_group_id" ]; then
-        echo "  $label (ID: $jump_group_id) already assigned"
-        return
+    # Skip if already assigned so re-runs stay safe. A 404 here just means "not assigned yet".
+    local existing existing_code
+    existing=$(api_call_status "GET" "/group-policy/$GROUP_POLICY_ID/jump-group/$jump_group_id" "")
+    existing_code=$(http_code "$existing")
+    if [ "$existing_code" -ge 200 ] && [ "$existing_code" -lt 300 ]; then
+        if [ "$(http_body "$existing" | jq -r '.jump_group_id // empty' 2>/dev/null)" = "$jump_group_id" ]; then
+            echo "  $label (ID: $jump_group_id) already assigned"
+            return
+        fi
     fi
 
+    # Note: this endpoint accepts only jump_group_id and jump_item_role_id. Sending
+    # jump_group_type (valid on the jump-item endpoints) is rejected outright.
     local assignment_data
     assignment_data=$(cat <<JSON
 {
     "jump_group_id": $jump_group_id,
-    "jump_group_type": "shared",
     "jump_item_role_id": $JUMP_ITEM_ROLE_ID
 }
 JSON
 )
 
-    local response
-    response=$(api_call "POST" "/group-policy/$GROUP_POLICY_ID/jump-group" "$assignment_data")
+    local response body code
+    response=$(api_call_status "POST" "/group-policy/$GROUP_POLICY_ID/jump-group" "$assignment_data")
+    body=$(http_body "$response")
+    code=$(http_code "$response")
 
-    if [ "$(echo "$response" | jq -r '.jump_group_id // empty')" = "$jump_group_id" ]; then
+    if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
         add_bt_resource "group_policy_jump_group" "$jump_group_id" "$label" \
             '{"group_policy_id": "'"$GROUP_POLICY_ID"'", "jump_item_role_id": "'"$JUMP_ITEM_ROLE_ID"'"}'
         echo "  Assigned $label (ID: $jump_group_id) with jump item role $JUMP_ITEM_ROLE_ID"
     else
-        echo "  ERROR: Failed to assign $label (ID: $jump_group_id)"
-        echo "         API response: $response"
+        echo "  ERROR: Failed to assign $label (ID: $jump_group_id) - HTTP $code"
+        echo "         API response: $body"
+        explain_failure "$code"
+        FAILURES=$((FAILURES + 1))
     fi
 }
 
-# Read an ID written by 'terraform output' during deployment
-read_group_id() {
+# Resolve a Jump Group ID: prefer the file written by 'terraform output', and fall
+# back to an exact name lookup (the *_id.txt files are removed by --cleanup).
+resolve_group_id() {
     local file="$TF_DIR/$1"
-    [ -f "$file" ] && tr -d '[:space:]' < "$file"
+    local name="$2"
+    local id=""
+
+    if [ -f "$file" ]; then
+        id=$(tr -d '[:space:]' < "$file")
+    fi
+
+    if [ -z "$id" ] || [ "$id" = "null" ]; then
+        id=$(api_call "GET" "/jump-group" "" \
+            | jq -r --arg n "$name" '.[]? | select(.name == $n) | .id' 2>/dev/null | head -1)
+    fi
+
+    echo "$id"
 }
 
 # Main execution
+if [ "$1" = "--list" ]; then
+    list_options
+    exit 0
+fi
+
 verify_group_policy || exit 1
 
-assign_jump_group "$(read_group_id demo_group_id.txt)" "${JUMP_GROUP_DEMO:-Demo Servers}"
-assign_jump_group "$(read_group_id dc_group_id.txt)" "${JUMP_GROUP_DC:-Domain Controllers}"
-assign_jump_group "$(read_group_id linux_group_id.txt)" "${JUMP_GROUP_LINUX:-Linux Servers}"
+JUMP_GROUP_DEMO="${JUMP_GROUP_DEMO:-Demo Servers}"
+JUMP_GROUP_DC="${JUMP_GROUP_DC:-Domain Controllers}"
+JUMP_GROUP_LINUX="${JUMP_GROUP_LINUX:-Linux Servers}"
+
+assign_jump_group "$(resolve_group_id demo_group_id.txt "$JUMP_GROUP_DEMO")" "$JUMP_GROUP_DEMO"
+assign_jump_group "$(resolve_group_id dc_group_id.txt "$JUMP_GROUP_DC")" "$JUMP_GROUP_DC"
+assign_jump_group "$(resolve_group_id linux_group_id.txt "$JUMP_GROUP_LINUX")" "$JUMP_GROUP_LINUX"
+
+if [ "$FAILURES" -gt 0 ]; then
+    echo "Asset group assignment FAILED for $FAILURES of 3 groups"
+    echo "Run './run-with-config.sh configure-group-policy.sh --list' to inspect this instance."
+    exit 1
+fi
 
 echo "Asset group assignment completed"
 EOF
@@ -3311,7 +3484,13 @@ main() {
     
     # Validate configuration
     validate_config
-    
+
+    # Assign asset groups to the group policy only, against an existing deployment
+    if [ "$GROUP_POLICY_ONLY" = true ]; then
+        run_group_policy_assignment_only
+        exit 0
+    fi
+
     # Install prerequisites
     install_prerequisites
     
@@ -3345,7 +3524,12 @@ main() {
     echo "BeyondTrust Resources:"
     echo "  Instance: $BT_API_HOST"
     echo "  Jump Groups: $JUMP_GROUP_DEMO, $JUMP_GROUP_DC, $JUMP_GROUP_LINUX"
-    echo "  Group Policy: ID $GROUP_POLICY_ID - all three asset groups assigned with jump item role $JUMP_ITEM_ROLE_ID"
+    if [ "${GROUP_POLICY_ASSIGNED:-false}" = true ]; then
+        echo "  Group Policy: ID $GROUP_POLICY_ID - all three asset groups assigned with jump item role $JUMP_ITEM_ROLE_ID"
+    else
+        echo "  Group Policy: ID $GROUP_POLICY_ID - ASSIGNMENT FAILED, asset groups are NOT assigned"
+        echo "                Re-run with: ./deploy-infra.sh --group-policy-only"
+    fi
     echo "  Jumpoint: $JUMPOINT_NAME on DC01"
     echo "  Jump Items: RDP access to DC01 and SQL01, MSSQL tunnel to SQL01, SSH Shell Jump to Ubuntu01"
     echo "  Vault Accounts (Windows): $DOMAIN_NETBIOS_NAME\\testadmin, $DOMAIN_NETBIOS_NAME\\jsmith, $DOMAIN_NETBIOS_NAME\\mjohnson, $DOMAIN_NETBIOS_NAME\\bdavis"
