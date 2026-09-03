@@ -228,9 +228,14 @@ VAULT_ACCOUNT_GROUP_ID="4"
 # The default of 2 is the built-in "Administrator" policy
 GROUP_POLICY_ID="2"
 
-# Jump Item Role granted to the group policy on those asset groups
-# Find this in the BeyondTrust console: Jump -> Jump Item Roles
-JUMP_ITEM_ROLE_ID="2"
+# Jump Item Role granted to the group policy on those asset groups.
+# Pin it by numeric ID here if you know it - find it under Jump -> Jump Item Roles,
+# or run ./deploy-infra.sh --group-policy-only --list
+JUMP_ITEM_ROLE_ID=""
+
+# If JUMP_ITEM_ROLE_ID is left empty, the role is looked up by this name instead.
+# Role IDs differ between instances; names do not, so this is the portable option.
+JUMP_ITEM_ROLE_NAME="Administrator"
 
 # To see the group policies and jump item roles on your instance, run:
 #   ./deploy-infra.sh --group-policy-only --list"
@@ -288,7 +293,7 @@ validate_config() {
     JUMPOINT_NAME="${RESOURCE_PREFIX}${JUMPOINT_NAME:-DC01_Jumpoint}"
     VAULT_ACCOUNT_GROUP_ID="${VAULT_ACCOUNT_GROUP_ID:-4}"
     GROUP_POLICY_ID="${GROUP_POLICY_ID:-2}"
-    JUMP_ITEM_ROLE_ID="${JUMP_ITEM_ROLE_ID:-2}"
+    JUMP_ITEM_ROLE_NAME="${JUMP_ITEM_ROLE_NAME-Administrator}"
     LINUX_ADMIN_USERNAME="${LINUX_ADMIN_USERNAME:-linuxadmin}"
     LINUX_ADMIN_PASSWORD="${LINUX_ADMIN_PASSWORD:-UbuntuPass123!}"
     JUMP_GROUP_LINUX="${RESOURCE_PREFIX}${JUMP_GROUP_LINUX:-Linux Servers}"
@@ -298,7 +303,7 @@ validate_config() {
     export DOMAIN_NAME DOMAIN_NETBIOS_NAME ADMIN_USERNAME ADMIN_PASSWORD
     export JUMP_GROUP_DEMO JUMP_GROUP_DC JUMPOINT_NAME VAULT_ACCOUNT_GROUP_ID
     export LINUX_ADMIN_USERNAME LINUX_ADMIN_PASSWORD JUMP_GROUP_LINUX
-    export GROUP_POLICY_ID JUMP_ITEM_ROLE_ID
+    export GROUP_POLICY_ID JUMP_ITEM_ROLE_ID JUMP_ITEM_ROLE_NAME
 
     print_status "Configuration validated successfully"
 }
@@ -1343,7 +1348,7 @@ deploy_beyondtrust() {
     export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET RESOURCE_PREFIX APPROVER_EMAIL
     export JUMP_GROUP_DEMO JUMP_GROUP_DC JUMPOINT_NAME ADMIN_USERNAME ADMIN_PASSWORD DOMAIN_NAME
     export VAULT_ACCOUNT_GROUP_ID
-    export GROUP_POLICY_ID JUMP_ITEM_ROLE_ID
+    export GROUP_POLICY_ID JUMP_ITEM_ROLE_ID JUMP_ITEM_ROLE_NAME
 
     # Update state
     update_metadata "beyondtrust_instance" "$BT_API_HOST"
@@ -1531,7 +1536,8 @@ export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET APPROVER_EMAIL RESOURCE_PREFIX
 export DOMAIN_NAME DOMAIN_NETBIOS_NAME ADMIN_USERNAME ADMIN_PASSWORD
 export VAULT_ACCOUNT_GROUP_ID="${VAULT_ACCOUNT_GROUP_ID:-4}"
 export GROUP_POLICY_ID="${GROUP_POLICY_ID:-2}"
-export JUMP_ITEM_ROLE_ID="${JUMP_ITEM_ROLE_ID:-2}"
+export JUMP_ITEM_ROLE_ID="${JUMP_ITEM_ROLE_ID:-}"
+export JUMP_ITEM_ROLE_NAME="${JUMP_ITEM_ROLE_NAME-Administrator}"
 export JUMP_GROUP_DEMO="${RESOURCE_PREFIX}Demo Servers"
 export JUMP_GROUP_DC="${RESOURCE_PREFIX}Domain Controllers"
 export JUMP_GROUP_LINUX="${RESOURCE_PREFIX}Linux Servers"
@@ -1866,7 +1872,8 @@ source "$(dirname "$0")/bt-api.sh"
 source "$(dirname "$0")/state-helper.sh"
 
 GROUP_POLICY_ID="${GROUP_POLICY_ID:-2}"
-JUMP_ITEM_ROLE_ID="${JUMP_ITEM_ROLE_ID:-2}"
+JUMP_ITEM_ROLE_NAME="${JUMP_ITEM_ROLE_NAME-Administrator}"
+JUMP_ITEM_ROLE_ID="${JUMP_ITEM_ROLE_ID:-}"
 TF_DIR="$(dirname "$0")/../terraform"
 
 FAILURES=0
@@ -1910,6 +1917,39 @@ list_options() {
     fi
 }
 
+# Resolve the jump item role to a numeric ID. Names are stable across instances,
+# the numeric IDs are not - a hardcoded 2 turned out to be "Start Sessions Only"
+# rather than "Administrator". JUMP_ITEM_ROLE_ID pins it by number if set and
+# JUMP_ITEM_ROLE_NAME is empty.
+resolve_jump_item_role() {
+    local roles
+
+    if [ -n "$JUMP_ITEM_ROLE_ID" ]; then
+        echo "Using jump item role ID $JUMP_ITEM_ROLE_ID (pinned by JUMP_ITEM_ROLE_ID)"
+        return 0
+    fi
+
+    if [ -z "$JUMP_ITEM_ROLE_NAME" ]; then
+        echo "ERROR: Set JUMP_ITEM_ROLE_ID or JUMP_ITEM_ROLE_NAME in config.env"
+        return 1
+    fi
+
+    roles=$(api_call "GET" "/jump-item-role" "")
+    JUMP_ITEM_ROLE_ID=$(echo "$roles" \
+        | jq -r --arg n "$JUMP_ITEM_ROLE_NAME" '.[]? | select(.name == $n) | .id' 2>/dev/null | head -1)
+
+    if [ -z "$JUMP_ITEM_ROLE_ID" ] || [ "$JUMP_ITEM_ROLE_ID" = "null" ]; then
+        echo "ERROR: No jump item role named \"$JUMP_ITEM_ROLE_NAME\" on $BT_API_HOST"
+        echo "       Available roles:"
+        echo "$roles" | jq -r '.[]? | "         \(.id): \(.name)"' 2>/dev/null \
+            || echo "         Could not list roles: $roles"
+        echo "       Set JUMP_ITEM_ROLE_NAME in config.env to one of the names above."
+        return 1
+    fi
+
+    echo "Using jump item role \"$JUMP_ITEM_ROLE_NAME\" (ID $JUMP_ITEM_ROLE_ID)"
+}
+
 # Confirm the target group policy exists before attempting any assignment.
 # A bad ID here would otherwise fail once per asset group with the same opaque error.
 verify_group_policy() {
@@ -1930,6 +1970,49 @@ verify_group_policy() {
     echo "Assigning asset groups to group policy $GROUP_POLICY_ID ($policy_name)"
 }
 
+# Change the jump item role on an assignment that already exists. Tries PATCH first;
+# some versions expose only create/delete on this endpoint, so fall back to
+# delete-then-recreate.
+update_jump_item_role() {
+    local jump_group_id="$1"
+    local label="$2"
+    local current_role="$3"
+
+    local payload response code
+    payload="{\"jump_item_role_id\": $JUMP_ITEM_ROLE_ID}"
+
+    response=$(api_call_status "PATCH" "/group-policy/$GROUP_POLICY_ID/jump-group/$jump_group_id" "$payload")
+    code=$(http_code "$response")
+
+    if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+        # Fall back to delete + recreate
+        api_call_status "DELETE" "/group-policy/$GROUP_POLICY_ID/jump-group/$jump_group_id" "" > /dev/null
+        response=$(api_call_status "POST" "/group-policy/$GROUP_POLICY_ID/jump-group" \
+            "$(assignment_payload "$jump_group_id")")
+        code=$(http_code "$response")
+    fi
+
+    if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+        echo "  $label (ID: $jump_group_id) jump item role changed from ${current_role:-none} to $JUMP_ITEM_ROLE_ID"
+    else
+        echo "  ERROR: Failed to change jump item role on $label (ID: $jump_group_id) - HTTP $code"
+        echo "         API response: $(http_body "$response")"
+        explain_failure "$code"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+# The POST body for an assignment. This endpoint accepts only jump_group_id and
+# jump_item_role_id; jump_group_type (valid on the jump-item endpoints) is rejected.
+assignment_payload() {
+    cat <<JSON
+{
+    "jump_group_id": $1,
+    "jump_item_role_id": $JUMP_ITEM_ROLE_ID
+}
+JSON
+}
+
 # Add a single asset (Jump) group to the group policy
 assign_jump_group() {
     local jump_group_id="$1"
@@ -1941,27 +2024,25 @@ assign_jump_group() {
         return
     fi
 
-    # Skip if already assigned so re-runs stay safe. A 404 here just means "not assigned yet".
-    local existing existing_code
+    # Already assigned? A 404 here just means "not assigned yet". If it is assigned
+    # but with the wrong jump item role, correct it rather than skipping.
+    local existing existing_code current_role
     existing=$(api_call_status "GET" "/group-policy/$GROUP_POLICY_ID/jump-group/$jump_group_id" "")
     existing_code=$(http_code "$existing")
     if [ "$existing_code" -ge 200 ] && [ "$existing_code" -lt 300 ]; then
         if [ "$(http_body "$existing" | jq -r '.jump_group_id // empty' 2>/dev/null)" = "$jump_group_id" ]; then
-            echo "  $label (ID: $jump_group_id) already assigned"
+            current_role=$(http_body "$existing" | jq -r '.jump_item_role_id // empty' 2>/dev/null)
+            if [ "$current_role" = "$JUMP_ITEM_ROLE_ID" ]; then
+                echo "  $label (ID: $jump_group_id) already assigned with jump item role $JUMP_ITEM_ROLE_ID"
+                return
+            fi
+            update_jump_item_role "$jump_group_id" "$label" "$current_role"
             return
         fi
     fi
 
-    # Note: this endpoint accepts only jump_group_id and jump_item_role_id. Sending
-    # jump_group_type (valid on the jump-item endpoints) is rejected outright.
     local assignment_data
-    assignment_data=$(cat <<JSON
-{
-    "jump_group_id": $jump_group_id,
-    "jump_item_role_id": $JUMP_ITEM_ROLE_ID
-}
-JSON
-)
+    assignment_data=$(assignment_payload "$jump_group_id")
 
     local response body code
     response=$(api_call_status "POST" "/group-policy/$GROUP_POLICY_ID/jump-group" "$assignment_data")
@@ -2006,6 +2087,7 @@ if [ "$1" = "--list" ]; then
 fi
 
 verify_group_policy || exit 1
+resolve_jump_item_role || exit 1
 
 JUMP_GROUP_DEMO="${JUMP_GROUP_DEMO:-Demo Servers}"
 JUMP_GROUP_DC="${JUMP_GROUP_DC:-Domain Controllers}"

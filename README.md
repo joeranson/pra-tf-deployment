@@ -140,7 +140,8 @@ All variables live in `~/beyondtrust-demo/config.env`.
 | `RESOURCE_PREFIX` | `Demo_` | No | Prefix applied to all created BeyondTrust resources |
 | `VAULT_ACCOUNT_GROUP_ID` | `4` | Yes | Numeric ID of the vault account group that demo accounts are assigned to. Find it in BeyondTrust console → Vault → Account Groups. |
 | `GROUP_POLICY_ID` | `2` | No | Numeric ID of the group policy the asset (jump) groups are assigned to. `2` is the built-in `Administrator` policy. Find it with `--group-policy-only --list`, or in BeyondTrust console → Users & Security → Group Policies. |
-| `JUMP_ITEM_ROLE_ID` | `2` | No | Numeric ID of the jump item role granted to that group policy on the asset groups. Find it with `--group-policy-only --list`, or in BeyondTrust console → Jump → Jump Item Roles. |
+| `JUMP_ITEM_ROLE_ID` | _(empty)_ | No | Numeric ID of the jump item role granted to that group policy on the asset groups. Takes precedence over `JUMP_ITEM_ROLE_NAME` when set. Find it with `--group-policy-only --list`, or in BeyondTrust console → Jump → Jump Item Roles. |
+| `JUMP_ITEM_ROLE_NAME` | `Administrator` | No | Used when `JUMP_ITEM_ROLE_ID` is empty: the role is looked up by name. Role IDs differ between instances, names generally don't, so this is the portable option. |
 | `JUMP_GROUP_DEMO` | `Demo Servers` | No | Name of the jump group for demo servers |
 | `JUMP_GROUP_DC` | `Domain Controllers` | No | Name of the jump group for domain controllers |
 | `JUMP_GROUP_LINUX` | `Linux Servers` | No | Name of the jump group for Linux servers |
@@ -206,7 +207,7 @@ BeyondTrust PRA
 │   ├── Domain Controllers — DC01 jump items
 │   └── Linux Servers      — Ubuntu01 jump items
 ├── Group Policy (ID 2 — Administrator)
-│   └── all three asset groups assigned, jump item role 2
+│   └── all three asset groups assigned with the Administrator jump item role
 ├── Jump Items
 │   ├── SQL01 RDP          — approval-required policy
 │   ├── SQL01 IIS Web      — approval-required policy
@@ -243,6 +244,8 @@ Then set `GROUP_POLICY_ID` and `JUMP_ITEM_ROLE_ID` in `config.env` to match, and
 ```bash
 ./deploy-infra.sh --group-policy-only
 ```
+
+If the asset groups end up with the wrong permissions — for example *Start Sessions Only* instead of *Administrator* — the jump item role is wrong. Jump item role IDs are **not** consistent between instances, so prefer leaving `JUMP_ITEM_ROLE_ID` empty and letting `JUMP_ITEM_ROLE_NAME` resolve it. Re-running after changing either value corrects groups that are already assigned; it does not silently skip them.
 
 A `403` means the API account cannot manage group policies — grant it *Group Policy* access under Configuration → API Accounts. A failed assignment no longer stops the rest of the deployment; it prints a warning and the final summary says the groups were not assigned.
 
