@@ -3607,7 +3607,7 @@ main() {
     echo "  Instance: $BT_API_HOST"
     echo "  Jump Groups: $JUMP_GROUP_DEMO, $JUMP_GROUP_DC, $JUMP_GROUP_LINUX"
     if [ "${GROUP_POLICY_ASSIGNED:-false}" = true ]; then
-        echo "  Group Policy: ID $GROUP_POLICY_ID - all three asset groups assigned with jump item role $JUMP_ITEM_ROLE_ID"
+        echo "  Group Policy: ID $GROUP_POLICY_ID - all three asset groups assigned with jump item role ${JUMP_ITEM_ROLE_ID:-$JUMP_ITEM_ROLE_NAME}"
     else
         echo "  Group Policy: ID $GROUP_POLICY_ID - ASSIGNMENT FAILED, asset groups are NOT assigned"
         echo "                Re-run with: ./deploy-infra.sh --group-policy-only"
