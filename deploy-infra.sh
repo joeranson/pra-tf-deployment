@@ -11,6 +11,8 @@
 #   ./deploy-infra.sh --with-rds               # Also deploy RDS roles and publish SSMS RemoteApp
 #   ./deploy-infra.sh --group-policy-only      # Only assign asset groups to the group policy
 #   ./deploy-infra.sh --group-policy-only --list  # List group policies and jump item roles
+#   ./deploy-infra.sh --ssh-ca-only            # Only add SSH certificate login to Ubuntu01
+#   ./deploy-infra.sh --k8s-only               # Only add the Kubernetes tunnel (k3s on Ubuntu01)
 
 set -e
 
@@ -26,6 +28,10 @@ Usage: ./deploy-infra.sh [FLAG]
                                    and Ansible. Safe to re-run - the assignment is idempotent.
   --group-policy-only --list       Show this instance's group policies, jump item roles and
                                    current assignments without changing anything
+  --ssh-ca-only                    Add SSH certificate login (PRA Vault SSH CA) to Ubuntu01 on
+                                   an existing deployment. Safe to re-run.
+  --k8s-only                       Add the Kubernetes Cluster Tunnel (k3s and a Linux Jumpoint
+                                   on Ubuntu01) to an existing deployment. Safe to re-run.
   --help, -h                       Show this message
 USAGE
 }
@@ -51,13 +57,25 @@ if [ "$1" = "--group-policy-only" ]; then
     GROUP_POLICY_ARGS="$2"
 fi
 
+# Check for --ssh-ca-only / --k8s-only: add one feature to an existing deployment
+SSH_CA_ONLY=false
+if [ "$1" = "--ssh-ca-only" ]; then
+    SSH_CA_ONLY=true
+fi
+
+K8S_ONLY=false
+if [ "$1" = "--k8s-only" ]; then
+    K8S_ONLY=true
+fi
+
 if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     usage
     exit 0
 fi
 
 # Reject anything unrecognised rather than silently starting a full deployment
-if [ -n "$1" ] && [ "$CLEANUP_MODE" = false ] && [ "$WITH_RDS" = false ] && [ "$GROUP_POLICY_ONLY" = false ]; then
+if [ -n "$1" ] && [ "$CLEANUP_MODE" = false ] && [ "$WITH_RDS" = false ] && [ "$GROUP_POLICY_ONLY" = false ] \
+    && [ "$SSH_CA_ONLY" = false ] && [ "$K8S_ONLY" = false ]; then
     echo "Unknown option: $1"
     echo ""
     usage
@@ -121,6 +139,16 @@ add_resource() {
            created_at: $timestamp
        } + $data]' \
        "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+}
+
+# As add_resource, but skips the entry when this type and ID are already recorded, so a
+# step that is re-run (e.g. by --k8s-only) does not duplicate the state
+add_resource_once() {
+    if [ -f "$STATE_FILE" ] && jq -e --arg type "$1" --arg id "$2" \
+        '.resources[$type][]? | select(.id == $id)' "$STATE_FILE" > /dev/null 2>&1; then
+        return 0
+    fi
+    add_resource "$@"
 }
 
 get_resources() {
@@ -264,6 +292,29 @@ LINUX_ADMIN_PASSWORD="UbuntuPass123!"
 
 # Optional: Override default Linux BeyondTrust Jump Group name
 # JUMP_GROUP_LINUX="Linux Servers"
+
+#===========================================
+# SSH CERTIFICATE LOGIN (PRA Vault SSH CA)
+#===========================================
+
+# Set to false to skip certificate login (needs PRA 23.3.1 or later)
+ENABLE_SSH_CA="true"
+
+# Ubuntu user that can only log in with a short lived certificate signed by the PRA
+# Vault SSH CA. It is created with no password; its vault account holds the CA, not a secret.
+# Must not be LINUX_ADMIN_USERNAME.
+LINUX_CERT_USERNAME="certadmin"
+
+#===========================================
+# KUBERNETES CLUSTER TUNNEL (k3s on Ubuntu01)
+#===========================================
+
+# Set to false to skip the Kubernetes tunnel (needs PRA 24.1.1 or later). It also adds a
+# Linux Jumpoint on Ubuntu01, because PRA only runs this tunnel through a Linux Jumpoint.
+ENABLE_K8S_TUNNEL="true"
+
+# k3s release to install, e.g. v1.33.4+k3s1. Leave empty for the current stable release.
+K3S_VERSION=""
 EOF
         
         print_warning "Configuration file created at: $CONFIG_FILE"
@@ -271,6 +322,18 @@ EOF
         print_status "After configuration, run this script again to deploy"
         exit 0
     fi
+}
+
+# Defaults for the certificate login and Kubernetes settings, which older config files do
+# not have. deploy_beyondtrust calls this again after it re-reads config.env.
+apply_feature_defaults() {
+    ENABLE_SSH_CA="${ENABLE_SSH_CA:-true}"
+    ENABLE_K8S_TUNNEL="${ENABLE_K8S_TUNNEL:-true}"
+    LINUX_CERT_USERNAME="${LINUX_CERT_USERNAME:-certadmin}"
+    K3S_VERSION="${K3S_VERSION:-}"
+    # Deliberately not configurable: re-reading config.env would drop the prefix from an
+    # override, and run-with-config.sh derives the same name
+    LINUX_JUMPOINT_NAME="${RESOURCE_PREFIX}Ubuntu01_Jumpoint"
 }
 
 # Validate configuration
@@ -297,6 +360,25 @@ validate_config() {
     LINUX_ADMIN_USERNAME="${LINUX_ADMIN_USERNAME:-linuxadmin}"
     LINUX_ADMIN_PASSWORD="${LINUX_ADMIN_PASSWORD:-UbuntuPass123!}"
     JUMP_GROUP_LINUX="${RESOURCE_PREFIX}${JUMP_GROUP_LINUX:-Linux Servers}"
+    apply_feature_defaults
+
+    if [ "$ENABLE_SSH_CA" != true ] && [ "$ENABLE_SSH_CA" != false ]; then
+        print_error "ENABLE_SSH_CA must be true or false in $CONFIG_FILE"
+    fi
+    if [ "$ENABLE_K8S_TUNNEL" != true ] && [ "$ENABLE_K8S_TUNNEL" != false ]; then
+        print_error "ENABLE_K8S_TUNNEL must be true or false in $CONFIG_FILE"
+    fi
+
+    # Both values end up in scripts that run as root on Ubuntu01, so only plain values are
+    # accepted. The certificate user is locked and given passwordless sudo, so it must never
+    # be the admin account that the password Shell Jump relies on.
+    if ! echo "$LINUX_CERT_USERNAME" | grep -qE '^[a-z_][a-z0-9_-]{0,31}$' \
+        || [ "$LINUX_CERT_USERNAME" = "$LINUX_ADMIN_USERNAME" ] || [ "$LINUX_CERT_USERNAME" = "root" ]; then
+        print_error "LINUX_CERT_USERNAME must be a new lowercase Linux user name (not root or $LINUX_ADMIN_USERNAME)"
+    fi
+    if [ -n "$K3S_VERSION" ] && ! echo "$K3S_VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$'; then
+        print_error "K3S_VERSION must look like v1.33.4+k3s1, or be empty for the current stable release"
+    fi
 
     # EXPORT ALL VARIABLES (FIX)
     export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET APPROVER_EMAIL RESOURCE_PREFIX
@@ -304,6 +386,7 @@ validate_config() {
     export JUMP_GROUP_DEMO JUMP_GROUP_DC JUMPOINT_NAME VAULT_ACCOUNT_GROUP_ID
     export LINUX_ADMIN_USERNAME LINUX_ADMIN_PASSWORD JUMP_GROUP_LINUX
     export GROUP_POLICY_ID JUMP_ITEM_ROLE_ID JUMP_ITEM_ROLE_NAME
+    export ENABLE_SSH_CA ENABLE_K8S_TUNNEL LINUX_CERT_USERNAME K3S_VERSION LINUX_JUMPOINT_NAME
 
     print_status "Configuration validated successfully"
 }
@@ -623,6 +706,21 @@ resource "azurerm_network_security_group" "linux" {
     source_port_range          = "*"
     destination_port_range     = "22"
     source_address_prefix      = var.allowed_rdp_source_ip
+    destination_address_prefix = "*"
+  }
+
+  # k3s API server and kubelet. The only client is the Linux Jumpoint on the same VM,
+  # which connects locally and never crosses the NSG, so nothing may reach these ports
+  # over the network. The only way to the cluster is through PRA.
+  security_rule {
+    name                       = "K8s-Deny-Inbound"
+    priority                   = 110
+    direction                  = "Inbound"
+    access                     = "Deny"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_ranges    = ["6443", "10250"]
+    source_address_prefix      = "*"
     destination_address_prefix = "*"
   }
 }
@@ -1337,6 +1435,717 @@ run_group_policy_assignment_only() {
     (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-group-policy.sh $GROUP_POLICY_ARGS)
 }
 
+# =============================================================================
+# Ubuntu01: SSH certificate login and the Kubernetes Cluster Tunnel
+# Everything on the VM goes through Azure run-command, as the Jump Client install does.
+# These steps are optional: callers treat a non-zero return as "not configured", so each
+# function returns 1 on failure rather than calling print_error.
+# =============================================================================
+
+# Quote a value for a POSIX sh script: wrap it in single quotes, escaping any inside it
+sh_quote() {
+    local s=${1//\'/\'\\\'\'}
+    printf "'%s'" "$s"
+}
+
+# Build a script for Ubuntu01: NAME=value lines (quoted with sh_quote), then the body that
+# the function named in $1 prints. Values only ever reach the VM as variables, so the
+# bodies are quoted heredocs that need no escaping. Usage: build_remote_script FN [NAME VALUE]...
+build_remote_script() {
+    local body_fn="$1"
+    shift
+    while [ $# -ge 2 ]; do
+        printf '%s=%s\n' "$1" "$(sh_quote "$2")"
+        shift 2
+    done
+    "$body_fn"
+}
+
+# Run a script on Ubuntu01 and leave the combined output in RUN_MESSAGE rather than
+# printing it, so callers decide what to show (never secrets). Returns 1 only when az
+# itself fails: run-command reports success even when the script fails, so callers read
+# the script's own NAME_OK / NAME_FAILED marker instead of an exit code.
+run_on_ubuntu() {
+    local script="$1"
+    local subscription result err_file
+    local sub_args=()
+
+    RUN_MESSAGE=""
+    # Standalone runs may start with a different default subscription in az
+    subscription=$(jq -r '.azure.subscription_id // empty' "$STATE_FILE" 2>/dev/null)
+    if [ -n "$subscription" ]; then
+        sub_args=(--subscription "$subscription")
+    fi
+
+    err_file=$(mktemp)
+    if ! result=$(az vm run-command invoke "${sub_args[@]}" \
+        --resource-group "rg-beyondtrust-${ENVIRONMENT}" \
+        --name "vm-ubuntu-${ENVIRONMENT}" \
+        --command-id RunShellScript \
+        --scripts "$script" \
+        --only-show-errors \
+        --output json 2>"$err_file"); then
+        print_warning "Azure run-command on Ubuntu01 failed: $(head -c 600 "$err_file")"
+        rm -f "$err_file"
+        return 1
+    fi
+    rm -f "$err_file"
+    RUN_MESSAGE=$(echo "$result" | jq -r '.value[0].message // empty' 2>/dev/null)
+}
+
+# Print the value of the last "NAME:value" line in the [stdout] part of RUN_MESSAGE.
+# Only stdout counts, so nothing written to stderr can pass for a marker.
+ubuntu_marker() {
+    printf '%s\n' "$RUN_MESSAGE" | awk -v m="$1:" '
+        $0 == "[stdout]" { s = 1; next }
+        $0 == "[stderr]" { s = 0; next }
+        s && index($0, m) == 1 { v = substr($0, length(m) + 1); f = 1 }
+        END { if (f && v != "") print v; else exit 1 }'
+}
+
+# Run a remote script that ends with MARKER_OK:<info> or MARKER_FAILED:<reason>, report
+# the result, and print the script's output (which ends with its log) when it failed
+run_ubuntu_step() {
+    local label="$1"
+    local marker="$2"
+    local script="$3"
+    local value
+
+    run_on_ubuntu "$script" || return 1
+    if value=$(ubuntu_marker "${marker}_OK"); then
+        print_status "$label: $value"
+        return 0
+    fi
+    print_warning "$label failed: $(ubuntu_marker "${marker}_FAILED" || echo "no result from the script")"
+    printf '%s\n' "$RUN_MESSAGE"
+    return 1
+}
+
+# Remote script: install the Linux Jumpoint and run it under systemd.
+# Needs BT_API_HOST, BT_TOKEN and JUMPOINT_ID.
+remote_jumpoint_body() {
+    cat <<'REMOTE'
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+JP_DIR=/opt/beyondtrust/jumpoint
+JP_USER=prajumpoint
+UNIT=/etc/systemd/system/pra-jumpoint.service
+mkdir -p /var/log/pra-demo
+LOG=/var/log/pra-demo/jumpoint.log
+fail() {
+    echo "--- end of $LOG ---"
+    tail -c 1500 "$LOG" 2>/dev/null
+    echo "JUMPOINT_FAILED:$1"
+    exit 0
+}
+
+if ! id "$JP_USER" >/dev/null 2>&1; then
+    useradd --system --home-dir "$JP_DIR" --shell /usr/sbin/nologin "$JP_USER" >>"$LOG" 2>&1 \
+        || fail "could not create user $JP_USER"
+fi
+
+# Install when missing, or reinstall when this VM holds a different Jumpoint (recreated in PRA)
+CHANGED=0
+if [ ! -x "$JP_DIR/init-script" ] || [ "$(cat "$JP_DIR/.pra-jumpoint-id" 2>/dev/null)" != "$JUMPOINT_ID" ]; then
+    if [ -x "$JP_DIR/init-script" ]; then
+        systemctl stop pra-jumpoint.service >>"$LOG" 2>&1
+        "$JP_DIR/init-script" stop >>"$LOG" 2>&1
+        rm -rf "$JP_DIR"
+    fi
+    mkdir -p "$JP_DIR" || fail "could not create $JP_DIR"
+    chown "$JP_USER" "$JP_DIR" || fail "could not give $JP_DIR to $JP_USER"
+
+    WORK=$(mktemp -d)
+    (cd "$WORK" && curl -fsS -J -O -H "Authorization: Bearer $BT_TOKEN" \
+        "$BT_API_HOST/api/config/v1/jumpoint/$JUMPOINT_ID/installer") >>"$LOG" 2>&1 \
+        || fail "installer download failed"
+    set -- "$WORK"/*
+    if [ $# -ne 1 ] || [ ! -f "$1" ] || [ "$(stat -c %s "$1")" -lt 1000000 ]; then
+        fail "unexpected installer download: $*"
+    fi
+    echo "Installing $(basename "$1")" >>"$LOG"
+    # No terminal to answer a prompt, so give up rather than hang until run-command times out
+    timeout 900 sh "$1" --install-dir "$JP_DIR" --user "$JP_USER" </dev/null >>"$LOG" 2>&1 \
+        || fail "installer exited with status $?"
+    rm -rf "$WORK"
+    [ -x "$JP_DIR/init-script" ] || fail "no init-script in $JP_DIR after the install"
+    echo "$JUMPOINT_ID" > "$JP_DIR/.pra-jumpoint-id"
+    CHANGED=1
+fi
+
+# The installer prints an example systemd unit. Follow its Type= and User= when it has them,
+# otherwise wrap init-script the way systemd wraps a classic init script.
+grep -E '^[[:space:]]*(Type|User|ExecStart|PIDFile)=' "$LOG" | sort -u | head -n 8 | sed 's/^[[:space:]]*/JUMPOINT_UNIT_HINT:/'
+UNIT_TYPE=$(sed -n 's/^[[:space:]]*Type=\([a-z]*\).*/\1/p' "$LOG" | tail -n 1)
+UNIT_USER=$(sed -n 's/^[[:space:]]*User=\([A-Za-z0-9_.-]*\).*/\1/p' "$LOG" | tail -n 1)
+[ -n "$UNIT_TYPE" ] || UNIT_TYPE=forking
+{
+    echo "[Unit]"
+    echo "Description=BeyondTrust PRA Linux Jumpoint"
+    echo "After=network-online.target"
+    echo "Wants=network-online.target"
+    echo ""
+    echo "[Service]"
+    echo "Type=$UNIT_TYPE"
+    if [ -n "$UNIT_USER" ]; then echo "User=$UNIT_USER"; fi
+    echo "ExecStart=$JP_DIR/init-script start"
+    echo "ExecStop=$JP_DIR/init-script stop"
+    echo "GuessMainPID=no"
+    echo "TimeoutStartSec=120"
+    echo ""
+    echo "[Install]"
+    echo "WantedBy=multi-user.target"
+} > "$UNIT.new"
+if cmp -s "$UNIT.new" "$UNIT"; then
+    rm -f "$UNIT.new"
+else
+    mv "$UNIT.new" "$UNIT"
+    systemctl daemon-reload >>"$LOG" 2>&1
+    CHANGED=1
+fi
+
+# Anything the installer started runs outside systemd, so stop it and let the unit own it
+if ! systemctl is-active --quiet pra-jumpoint.service; then
+    "$JP_DIR/init-script" stop >>"$LOG" 2>&1
+fi
+systemctl enable pra-jumpoint.service >>"$LOG" 2>&1 || fail "could not enable pra-jumpoint.service"
+if [ "$CHANGED" = 1 ]; then
+    systemctl restart pra-jumpoint.service >>"$LOG" 2>&1
+else
+    systemctl start pra-jumpoint.service >>"$LOG" 2>&1
+fi
+sleep 5
+if ! systemctl is-active --quiet pra-jumpoint.service; then
+    systemctl status pra-jumpoint.service --no-pager >>"$LOG" 2>&1
+    fail "pra-jumpoint.service is not running"
+fi
+"$JP_DIR/init-script" status >>"$LOG" 2>&1 || fail "init-script status reports the Jumpoint is not running"
+echo "JUMPOINT_OK:running under systemd as pra-jumpoint.service (Type=$UNIT_TYPE)"
+exit 0
+REMOTE
+}
+
+# Remote script: install k3s, create the demo service accounts and a small demo app.
+# Needs K3S_VERSION (empty for the stable release).
+remote_k3s_body() {
+    cat <<'REMOTE'
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mkdir -p /var/log/pra-demo
+LOG=/var/log/pra-demo/k3s.log
+fail() {
+    echo "--- end of $LOG ---"
+    tail -c 1500 "$LOG" 2>/dev/null
+    echo "K3S_FAILED:$1"
+    exit 0
+}
+kc() { k3s kubectl "$@"; }
+
+# Settings go in config.yaml, which k3s reads on every start, so re-runs converge.
+# The API certificate must name 10.0.3.10, the address the Linux Jumpoint connects to.
+mkdir -p /etc/rancher/k3s
+cat > /etc/rancher/k3s/config.yaml.new <<'YAML'
+# Written by deploy-infra.sh for the BeyondTrust PRA demo
+tls-san:
+  - "10.0.3.10"
+write-kubeconfig-mode: "0600"
+disable:
+  - traefik
+  - servicelb
+YAML
+CONFIG_CHANGED=0
+if cmp -s /etc/rancher/k3s/config.yaml.new /etc/rancher/k3s/config.yaml; then
+    rm -f /etc/rancher/k3s/config.yaml.new
+else
+    mv /etc/rancher/k3s/config.yaml.new /etc/rancher/k3s/config.yaml
+    CONFIG_CHANGED=1
+fi
+
+if ! command -v k3s >/dev/null 2>&1; then
+    # Download, then run: sh has no pipefail, so curl | sh would hide a failed download
+    curl -fsSL https://get.k3s.io -o /tmp/k3s-install.sh >>"$LOG" 2>&1 || fail "could not download the k3s installer"
+    INSTALL_K3S_VERSION="$K3S_VERSION" sh /tmp/k3s-install.sh >>"$LOG" 2>&1 || fail "the k3s installer failed"
+    rm -f /tmp/k3s-install.sh
+elif [ "$CONFIG_CHANGED" = 1 ]; then
+    systemctl restart k3s >>"$LOG" 2>&1 || fail "k3s did not restart"
+else
+    systemctl start k3s >>"$LOG" 2>&1 || fail "k3s did not start"
+fi
+
+i=0
+until kc get --raw /readyz >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -le 60 ] || fail "the API server was not ready after 5 minutes"
+    sleep 5
+done
+# wait fails at once if no node has registered yet, so wait for one to exist first
+i=0
+until [ -n "$(kc get nodes -o name 2>/dev/null)" ]; do
+    i=$((i + 1))
+    [ "$i" -le 60 ] || fail "no node registered"
+    sleep 2
+done
+kc wait --for=condition=Ready node --all --timeout=300s >>"$LOG" 2>&1 || fail "the node is not Ready"
+
+# Service accounts come before their token Secrets, which are deleted if created first
+kc apply -f - >>"$LOG" 2>&1 <<'YAML' || fail "could not apply the demo manifests"
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pra-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pra-admin
+  namespace: pra-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pra-readonly
+  namespace: pra-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pra-demo-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: pra-admin
+    namespace: pra-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pra-demo-readonly
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: pra-readonly
+    namespace: pra-demo
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pra-admin-token
+  namespace: pra-demo
+  annotations:
+    kubernetes.io/service-account.name: pra-admin
+type: kubernetes.io/service-account-token
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pra-readonly-token
+  namespace: pra-demo
+  annotations:
+    kubernetes.io/service-account.name: pra-readonly
+type: kubernetes.io/service-account-token
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-apps
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: demo-apps
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+YAML
+
+for sa in pra-admin pra-readonly; do
+    i=0
+    until [ -n "$(kc -n pra-demo get secret "$sa-token" -o jsonpath='{.data.token}' 2>/dev/null)" ]; do
+        i=$((i + 1))
+        [ "$i" -le 60 ] || fail "no token was issued for $sa"
+        sleep 2
+    done
+done
+
+# Prove the two identities really differ before PRA vaults them
+[ "$(kc auth can-i delete pods -n demo-apps --as=system:serviceaccount:pra-demo:pra-readonly 2>/dev/null)" = "no" ] \
+    || fail "pra-readonly can delete pods, so it is not read only"
+[ "$(kc auth can-i '*' '*' --as=system:serviceaccount:pra-demo:pra-admin 2>/dev/null)" = "yes" ] \
+    || fail "pra-admin is not cluster-admin"
+
+WARN=""
+kc -n demo-apps rollout status deployment/web --timeout=180s >>"$LOG" 2>&1 || WARN=", demo app still starting"
+echo "K3S_OK:$(k3s --version | head -n 1 | cut -d' ' -f3) ready$WARN"
+exit 0
+REMOTE
+}
+
+# Remote script: print the cluster CA and both service account tokens. Its output holds
+# secrets, so the caller parses it and never prints it. Order matters: run-command keeps
+# the end of the output, so the OK marker comes last and every item is checked.
+remote_k8s_export_body() {
+    cat <<'REMOTE'
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+fail() {
+    echo "K8S_EXPORT_FAILED:$1"
+    exit 0
+}
+CA=/var/lib/rancher/k3s/server/tls/server-ca.crt
+[ -s "$CA" ] || fail "no cluster CA at $CA"
+
+for sa in pra-admin pra-readonly; do
+    t=$(k3s kubectl -n pra-demo get secret "$sa-token" -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null)
+    [ -n "$t" ] || fail "no token for $sa"
+    # One request proves the CA, the certificate name and the token together
+    code=$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CA" -H "Authorization: Bearer $t" https://10.0.3.10:6443/api)
+    [ "$code" = "200" ] || fail "https://10.0.3.10:6443 rejected the $sa token (HTTP $code)"
+    echo "K8S_TOKEN_$sa:$t"
+done
+echo "K8S_CA_B64:$(base64 -w0 "$CA")"
+echo "K8S_EXPORT_OK:2 tokens"
+exit 0
+REMOTE
+}
+
+# Remote script: trust the PRA Vault SSH CA for a certificate only user.
+# Needs CERT_USER and CA_KEY (the bare public key, no cert-authority prefix).
+remote_ssh_ca_body() {
+    cat <<'REMOTE'
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MARK="PRA certificate login demo"
+CA_FILE=/etc/ssh/pra_user_ca.pub
+DROPIN=/etc/ssh/sshd_config.d/60-pra-ssh-ca.conf
+SUDOERS=/etc/sudoers.d/60-pra-cert-user
+mkdir -p /var/log/pra-demo
+LOG=/var/log/pra-demo/ssh-ca.log
+fail() {
+    echo "--- end of $LOG ---"
+    tail -c 1500 "$LOG" 2>/dev/null
+    echo "SSH_CA_FAILED:$1"
+    exit 0
+}
+
+# Only ever manage a user this script created, so an existing account (such as the admin
+# account the password Shell Jump uses) can never be locked by mistake
+if id "$CERT_USER" >/dev/null 2>&1; then
+    [ "$(getent passwd "$CERT_USER" | cut -d: -f5)" = "$MARK" ] \
+        || fail "user $CERT_USER already exists and was not created by this script"
+else
+    useradd --create-home --shell /bin/bash --comment "$MARK" "$CERT_USER" >>"$LOG" 2>&1 \
+        || fail "could not create $CERT_USER"
+fi
+# No usable password: a certificate signed by the PRA CA is the only way in
+usermod --lock "$CERT_USER" >>"$LOG" 2>&1 || fail "could not lock the password of $CERT_USER"
+
+# Passwordless sudo, since the account has no password to type (demo convenience)
+TMP=$(mktemp)
+printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$CERT_USER" > "$TMP"
+if ! visudo -cf "$TMP" >>"$LOG" 2>&1; then
+    rm -f "$TMP"
+    fail "the sudoers entry did not validate"
+fi
+install -m 0440 -o root -g root "$TMP" "$SUDOERS" || fail "could not install $SUDOERS"
+rm -f "$TMP"
+
+printf '%s\n' "$CA_KEY" > "$CA_FILE.new"
+FP=$(ssh-keygen -l -f "$CA_FILE.new" 2>>"$LOG") || { rm -f "$CA_FILE.new"; fail "the CA public key did not parse"; }
+chmod 0644 "$CA_FILE.new"
+mv "$CA_FILE.new" "$CA_FILE" || fail "could not install $CA_FILE"
+
+printf '%s\n' "# Accept user certificates signed by the BeyondTrust PRA Vault SSH CA (deploy-infra.sh)" \
+    "TrustedUserCAKeys $CA_FILE" > "$DROPIN"
+chmod 0644 "$DROPIN"
+
+# Never leave sshd with a configuration it rejects: that would break the password login too
+mkdir -p /run/sshd
+if ! sshd -t >>"$LOG" 2>&1; then
+    rm -f "$DROPIN"
+    fail "sshd rejected the configuration, so the change was reverted"
+fi
+# Ubuntu 24.04 starts ssh on demand; if it is not running, the next connection reads the new config
+systemctl try-restart ssh.service >>"$LOG" 2>&1 || fail "could not restart ssh"
+sshd -T 2>>"$LOG" | grep -qi "^trustedusercakeys $CA_FILE" || fail "sshd is not using $CA_FILE"
+echo "SSH_CA_OK:$(echo "$FP" | cut -d' ' -f2)"
+exit 0
+REMOTE
+}
+
+# Install the Linux Jumpoint on Ubuntu01
+install_linux_jumpoint_on_ubuntu() {
+    local id_file="$PROJECT_DIR/beyondtrust/terraform/linux_jumpoint_id.txt"
+    local jumpoint_id="" bt_token script
+
+    print_status "Installing the Linux Jumpoint on Ubuntu01 via Azure run-command..."
+    if [ -f "$id_file" ]; then
+        jumpoint_id=$(tr -d '[:space:]' < "$id_file")
+    fi
+    if ! echo "$jumpoint_id" | grep -qE '^[0-9]+$'; then
+        print_warning "No Linux Jumpoint ID in $id_file"
+        return 1
+    fi
+
+    # A fresh token for the VM to download the installer with, fetched just before use
+    if ! bt_token=$(cd "$PROJECT_DIR/beyondtrust/scripts" && source ./bt-api.sh && get_api_token); then
+        print_warning "Could not get a BeyondTrust API token for the Jumpoint download"
+        return 1
+    fi
+
+    script=$(build_remote_script remote_jumpoint_body \
+        BT_API_HOST "$BT_API_HOST" BT_TOKEN "$bt_token" JUMPOINT_ID "$jumpoint_id") || return 1
+    run_ubuntu_step "Linux Jumpoint" "JUMPOINT" "$script"
+}
+
+install_k3s_on_ubuntu() {
+    local script
+
+    print_status "Installing k3s on Ubuntu01 via Azure run-command (a first install takes a few minutes)..."
+    script=$(build_remote_script remote_k3s_body K3S_VERSION "$K3S_VERSION") || return 1
+    run_ubuntu_step "k3s" "K3S" "$script"
+}
+
+# Read the cluster CA (into downloads) and the two tokens (into the private folder $1).
+# The run-command output holds the tokens, so it is parsed but never printed, and the copy
+# Azure keeps on the VM is overwritten straight afterwards.
+export_k8s_credentials() {
+    local secrets_dir="$1"
+    local ca_file="$PROJECT_DIR/beyondtrust/downloads/k8s-ca.pem"
+    local script sa token ca_b64 reason=""
+
+    print_status "Reading the cluster CA and service account tokens from Ubuntu01..."
+    script=$(build_remote_script remote_k8s_export_body) || return 1
+    if ! run_on_ubuntu "$script"; then
+        # The script may still have run and left the tokens in the VM's run-command output
+        run_on_ubuntu 'echo "STATUS_CLEARED:1"' || true
+        RUN_MESSAGE=""
+        return 1
+    fi
+
+    if ! ubuntu_marker "K8S_EXPORT_OK" > /dev/null; then
+        reason=$(ubuntu_marker "K8S_EXPORT_FAILED" || echo "no result from the script")
+    fi
+    if [ -z "$reason" ]; then
+        for sa in pra-admin pra-readonly; do
+            token=$(ubuntu_marker "K8S_TOKEN_$sa" || true)
+            # A JWT is three base64url parts; anything else means the output was cut short
+            if ! echo "$token" | grep -qE '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'; then
+                reason="the $sa token was missing or incomplete"
+                break
+            fi
+            (umask 077 && printf '%s' "$token" > "$secrets_dir/token-$sa")
+        done
+    fi
+    if [ -z "$reason" ]; then
+        ca_b64=$(ubuntu_marker "K8S_CA_B64" || true)
+        if ! printf '%s' "$ca_b64" | base64 -d > "$ca_file" 2>/dev/null \
+            || ! grep -q 'BEGIN CERTIFICATE' "$ca_file"; then
+            reason="the cluster CA was missing or incomplete"
+            rm -f "$ca_file"
+        fi
+    fi
+    token=""
+    RUN_MESSAGE=""
+
+    # Azure keeps the last run-command output on the VM, readable with Reader access
+    if ! run_on_ubuntu 'echo "STATUS_CLEARED:1"'; then
+        print_warning "Could not overwrite the run-command output on Ubuntu01. Run any command on the VM to clear the tokens from it."
+    fi
+    RUN_MESSAGE=""
+
+    if [ -n "$reason" ]; then
+        print_warning "Could not read the Kubernetes credentials: $reason"
+        return 1
+    fi
+    print_status "Cluster CA saved to $ca_file; both tokens held in a private temporary folder"
+}
+
+# Trust the PRA SSH CA on Ubuntu01 for the certificate only user
+configure_ssh_ca_on_ubuntu() {
+    local ca_file="$PROJECT_DIR/beyondtrust/downloads/pra-ssh-ca.pub"
+    local ca_key script local_fp remote_fp
+
+    print_status "Configuring Ubuntu01 to trust the PRA SSH CA for $LINUX_CERT_USERNAME via Azure run-command..."
+    ca_key=$(head -n 1 "$ca_file" 2>/dev/null)
+    if ! echo "$ca_key" | grep -qE '^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+=*$'; then
+        print_warning "No usable CA public key in $ca_file"
+        return 1
+    fi
+
+    script=$(build_remote_script remote_ssh_ca_body \
+        CERT_USER "$LINUX_CERT_USERNAME" CA_KEY "$ca_key") || return 1
+    run_ubuntu_step "SSH CA trusted on Ubuntu01, fingerprint" "SSH_CA" "$script" || return 1
+
+    # The key Ubuntu01 now trusts must be the one PRA holds
+    if command -v ssh-keygen > /dev/null 2>&1; then
+        local_fp=$(ssh-keygen -l -f "$ca_file" 2>/dev/null | cut -d' ' -f2)
+        remote_fp=$(ubuntu_marker "SSH_CA_OK" || true)
+        if [ -n "$local_fp" ] && [ "$local_fp" != "$remote_fp" ]; then
+            print_warning "CA fingerprint mismatch: PRA holds $local_fp, Ubuntu01 trusts $remote_fp"
+            return 1
+        fi
+    fi
+}
+
+# Step 8: certificate login for Ubuntu01. The Shell Jump is only created once Ubuntu01
+# trusts the CA, so a failure never leaves a jump item in the console that cannot log in.
+deploy_ssh_certificate_login() {
+    print_status "Setting up SSH certificate login for Ubuntu01 (PRA Vault SSH CA)..."
+    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-ssh-ca.sh account) || return 1
+    configure_ssh_ca_on_ubuntu || return 1
+    (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-ssh-ca.sh jump-item) || return 1
+}
+
+# Step 9: Kubernetes Cluster Tunnel through the Linux Jumpoint. The tokens only ever sit in
+# a private temporary folder, removed when this returns whatever happened.
+deploy_kubernetes_tunnel() {
+    local secrets_dir rc
+
+    print_status "Setting up the Kubernetes Cluster Tunnel (k3s on Ubuntu01)..."
+    secrets_dir=$(mktemp -d) || return 1
+    if install_linux_jumpoint_on_ubuntu \
+        && install_k3s_on_ubuntu \
+        && export_k8s_credentials "$secrets_dir" \
+        && (cd "$PROJECT_DIR/beyondtrust/scripts" \
+            && K8S_SECRETS_DIR="$secrets_dir" ./run-with-config.sh configure-k8s-tunnel.sh); then
+        rc=0
+    else
+        rc=1
+    fi
+    rm -rf "$secrets_dir"
+    return "$rc"
+}
+
+# Stop early when Ubuntu01 is not running: demo VMs are often deallocated to save cost
+require_ubuntu_running() {
+    local subscription state
+    local sub_args=()
+
+    subscription=$(jq -r '.azure.subscription_id // empty' "$STATE_FILE" 2>/dev/null)
+    if [ -n "$subscription" ]; then
+        sub_args=(--subscription "$subscription")
+    fi
+    state=$(az vm get-instance-view "${sub_args[@]}" \
+        --resource-group "rg-beyondtrust-${ENVIRONMENT}" --name "vm-ubuntu-${ENVIRONMENT}" \
+        --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" \
+        --output tsv 2>/dev/null || true)
+    if [ "$state" != "PowerState/running" ]; then
+        print_error "Ubuntu01 (vm-ubuntu-${ENVIRONMENT}) is ${state:-not reachable}. Start it with: az vm start ${sub_args[*]} --resource-group rg-beyondtrust-${ENVIRONMENT} --name vm-ubuntu-${ENVIRONMENT}"
+    fi
+}
+
+# The K8s-Deny-Inbound rule from the Azure Terraform, for deployments made before it
+# existed. Same name and properties, so a later terraform apply sees no change.
+ensure_k8s_nsg_rule() {
+    local subscription
+    local sub_args=()
+    local rg="rg-beyondtrust-${ENVIRONMENT}"
+    local nsg="nsg-linux-${ENVIRONMENT}"
+
+    subscription=$(jq -r '.azure.subscription_id // empty' "$STATE_FILE" 2>/dev/null)
+    if [ -n "$subscription" ]; then
+        sub_args=(--subscription "$subscription")
+    fi
+    if az network nsg rule show "${sub_args[@]}" --resource-group "$rg" --nsg-name "$nsg" \
+        --name K8s-Deny-Inbound --output none &> /dev/null; then
+        return 0
+    fi
+
+    print_status "Closing the Kubernetes ports (6443, 10250) on $nsg..."
+    if ! az network nsg rule create "${sub_args[@]}" --resource-group "$rg" --nsg-name "$nsg" \
+        --name K8s-Deny-Inbound --priority 110 --direction Inbound --access Deny --protocol Tcp \
+        --source-address-prefixes '*' --source-port-ranges '*' \
+        --destination-address-prefixes '*' --destination-port-ranges 6443 10250 \
+        --only-show-errors --output none; then
+        print_warning "Could not add the NSG rule. Azure's default rules still block these ports from the internet."
+    fi
+}
+
+# Checks and script regeneration shared by --ssh-ca-only and --k8s-only, which work on an
+# existing deployment and skip everything else. Extra arguments are tools that must exist.
+prepare_feature_only_run() {
+    local enabled="$1"
+    local setting="$2"
+    local tool
+    shift 2
+
+    if [ ! -f "$STATE_FILE" ]; then
+        print_error "No deployment state found at $STATE_FILE. Run ./deploy-infra.sh first."
+    fi
+    if [ "$enabled" != true ]; then
+        print_error "$setting is false in $CONFIG_FILE. Set it to true to use this option."
+    fi
+    for tool in az jq curl "$@"; do
+        if ! command -v "$tool" &> /dev/null; then
+            print_error "$tool is not installed. Run ./deploy-infra.sh once to install the prerequisites."
+        fi
+    done
+
+    cd "$PROJECT_DIR"
+    if ! az account show &> /dev/null; then
+        az login
+    fi
+    require_ubuntu_running
+
+    # Regenerate the scripts these steps need so they match the current source. The
+    # cleanup script is included so --cleanup removes what this run creates.
+    create_beyondtrust_api_helper
+    create_beyondtrust_state_helper
+    create_beyondtrust_run_wrapper
+    create_beyondtrust_cleanup_script
+}
+
+# --ssh-ca-only: add SSH certificate login to an existing deployment
+run_ssh_ca_only() {
+    print_status "Adding SSH certificate login to the existing deployment..."
+    prepare_feature_only_run "$ENABLE_SSH_CA" "ENABLE_SSH_CA"
+    create_beyondtrust_ssh_ca_script
+
+    if ! deploy_ssh_certificate_login; then
+        print_error "SSH certificate login is not configured, see the output above. It is safe to re-run."
+    fi
+
+    print_status "SSH certificate login is ready"
+    echo "  Jump Item: ${RESOURCE_PREFIX}Ubuntu01 - SSH (Certificate) in $JUMP_GROUP_LINUX"
+    echo "  Vault Account: ${RESOURCE_PREFIX}Ubuntu01 Cert Admin (SSH CA), logs in as $LINUX_CERT_USERNAME (no password on Ubuntu01)"
+}
+
+# --k8s-only: add the Kubernetes Cluster Tunnel to an existing deployment
+run_k8s_only() {
+    print_status "Adding the Kubernetes Cluster Tunnel to the existing deployment..."
+    prepare_feature_only_run "$ENABLE_K8S_TUNNEL" "ENABLE_K8S_TUNNEL" terraform
+
+    # Adds the Linux Jumpoint; the jump groups and the DC01 Jumpoint are left as they are
+    print_status "Applying BeyondTrust Terraform to add the Linux Jumpoint..."
+    create_beyondtrust_terraform_config
+    apply_beyondtrust_terraform
+    ensure_k8s_nsg_rule
+    create_beyondtrust_k8s_tunnel_script
+
+    if ! deploy_kubernetes_tunnel; then
+        print_error "The Kubernetes tunnel is not configured, see the output above. It is safe to re-run."
+    fi
+
+    print_status "Kubernetes Cluster Tunnel is ready"
+    echo "  Jump Item: ${RESOURCE_PREFIX}Ubuntu01 - Kubernetes (k3s) in $JUMP_GROUP_LINUX, through $LINUX_JUMPOINT_NAME"
+    echo "  Vault Accounts: ${RESOURCE_PREFIX}K8s Admin (cluster-admin), ${RESOURCE_PREFIX}K8s Read Only (view)"
+}
+
 # Phase 3: BeyondTrust Integration
 deploy_beyondtrust() {
     print_status "Phase 3: Deploying BeyondTrust PRA integration..."
@@ -1345,10 +2154,12 @@ deploy_beyondtrust() {
     
     # Source config and EXPORT ALL VARIABLES (FIX)
     source "$CONFIG_FILE"
+    apply_feature_defaults
     export BT_API_HOST BT_CLIENT_ID BT_CLIENT_SECRET RESOURCE_PREFIX APPROVER_EMAIL
     export JUMP_GROUP_DEMO JUMP_GROUP_DC JUMPOINT_NAME ADMIN_USERNAME ADMIN_PASSWORD DOMAIN_NAME
     export VAULT_ACCOUNT_GROUP_ID
     export GROUP_POLICY_ID JUMP_ITEM_ROLE_ID JUMP_ITEM_ROLE_NAME
+    export ENABLE_SSH_CA ENABLE_K8S_TUNNEL LINUX_CERT_USERNAME K3S_VERSION LINUX_JUMPOINT_NAME
 
     # Update state
     update_metadata "beyondtrust_instance" "$BT_API_HOST"
@@ -1364,27 +2175,14 @@ deploy_beyondtrust() {
     create_beyondtrust_installer_script
     create_beyondtrust_jump_items_script
     create_beyondtrust_vault_script
+    create_beyondtrust_ssh_ca_script
+    create_beyondtrust_k8s_tunnel_script
     create_beyondtrust_cleanup_script
     create_beyondtrust_ansible_playbook
     
     # Step 1: Deploy Terraform resources
     print_status "Deploying BeyondTrust Terraform resources..."
-    pushd "$PROJECT_DIR/beyondtrust/terraform" > /dev/null
-    terraform init
-    terraform apply -auto-approve
-
-    # Save IDs for later use
-    terraform output -raw jump_group_demo_id > demo_group_id.txt
-    terraform output -raw jump_group_dc_id > dc_group_id.txt
-    terraform output -raw jumpoint_id > jumpoint_id.txt
-    terraform output -raw jump_group_linux_id > linux_group_id.txt
-
-    # Track Terraform resources in state
-    add_resource "jump_group" "$(cat demo_group_id.txt)" "$JUMP_GROUP_DEMO" '{"type": "shared", "managed_by": "terraform"}'
-    add_resource "jump_group" "$(cat dc_group_id.txt)" "$JUMP_GROUP_DC" '{"type": "shared", "managed_by": "terraform"}'
-    add_resource "jump_group" "$(cat linux_group_id.txt)" "$JUMP_GROUP_LINUX" '{"type": "shared", "managed_by": "terraform"}'
-    add_resource "jumpoint" "$(cat jumpoint_id.txt)" "$JUMPOINT_NAME" '{"platform": "windows-x86", "managed_by": "terraform"}'
-    popd > /dev/null
+    apply_beyondtrust_terraform
 
     # Step 2: Assign asset groups to the group policy (using wrapper)
     print_status "Assigning asset groups to group policy..."
@@ -1509,6 +2307,30 @@ journalctl --no-pager -n 30 2>/dev/null | grep -iE 'scc|bomgar|beyond|jumpclient
     print_status "Configuring vault accounts..."
     (cd "$PROJECT_DIR/beyondtrust/scripts" && ./run-with-config.sh configure-vault.sh)
 
+    # Step 8: SSH certificate login for Ubuntu01. Optional, so a failure does not stop the
+    # deployment; --ssh-ca-only finishes it later.
+    SSH_CA_CONFIGURED=skipped
+    if [ "$ENABLE_SSH_CA" = true ]; then
+        if deploy_ssh_certificate_login; then
+            SSH_CA_CONFIGURED=true
+        else
+            SSH_CA_CONFIGURED=false
+            print_warning "SSH certificate login is not fully configured, see the output above. Continuing deployment."
+        fi
+    fi
+
+    # Step 9: Kubernetes Cluster Tunnel (k3s and the Linux Jumpoint on Ubuntu01). Optional in
+    # the same way; --k8s-only finishes it later.
+    K8S_TUNNEL_CONFIGURED=skipped
+    if [ "$ENABLE_K8S_TUNNEL" = true ]; then
+        if deploy_kubernetes_tunnel; then
+            K8S_TUNNEL_CONFIGURED=true
+        else
+            K8S_TUNNEL_CONFIGURED=false
+            print_warning "The Kubernetes tunnel is not fully configured, see the output above. Continuing deployment."
+        fi
+    fi
+
     # Update deployment completed timestamp
     update_metadata "deployment_completed" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
@@ -1542,6 +2364,8 @@ export JUMP_GROUP_DEMO="${RESOURCE_PREFIX}Demo Servers"
 export JUMP_GROUP_DC="${RESOURCE_PREFIX}Domain Controllers"
 export JUMP_GROUP_LINUX="${RESOURCE_PREFIX}Linux Servers"
 export JUMPOINT_NAME="${RESOURCE_PREFIX}DC01_Jumpoint"
+export LINUX_JUMPOINT_NAME="${RESOURCE_PREFIX}Ubuntu01_Jumpoint"
+export LINUX_CERT_USERNAME="${LINUX_CERT_USERNAME:-certadmin}"
 
 # Run the requested script
 if [ -n "$1" ]; then
@@ -1623,6 +2447,56 @@ output "jump_group_linux_id" {
   value = sra_jump_group.linux_servers.id
 }
 EOF
+
+    # PRA only runs the Kubernetes Cluster Tunnel through a Linux Jumpoint, so a second
+    # Jumpoint is created for Ubuntu01 when that feature is enabled
+    if [ "${ENABLE_K8S_TUNNEL:-true}" = true ]; then
+        cat >> beyondtrust/terraform/main.tf << EOF
+
+# Linux Jumpoint on Ubuntu01, used only by the Kubernetes Cluster Tunnel
+resource "sra_jumpoint" "linux_jumpoint" {
+  name                    = "$LINUX_JUMPOINT_NAME"
+  code_name               = "ubuntu01_jumpoint"
+  platform                = "linux-x86"
+  shell_jump_enabled      = false
+  protocol_tunnel_enabled = true
+  enabled                 = true
+  comments                = "Linux Jumpoint on Ubuntu01 for the Kubernetes Cluster Tunnel"
+}
+
+output "linux_jumpoint_id" {
+  value = sra_jumpoint.linux_jumpoint.id
+}
+EOF
+    fi
+}
+
+# Apply the BeyondTrust Terraform (jump groups and Jumpoints), save the IDs that the
+# generated scripts read, and record them in the state file. Used by the full deployment
+# and by --k8s-only, which adds the Linux Jumpoint to an existing deployment.
+apply_beyondtrust_terraform() {
+    pushd "$PROJECT_DIR/beyondtrust/terraform" > /dev/null
+    terraform init
+    terraform apply -auto-approve
+
+    # Save IDs for later use
+    terraform output -raw jump_group_demo_id > demo_group_id.txt
+    terraform output -raw jump_group_dc_id > dc_group_id.txt
+    terraform output -raw jumpoint_id > jumpoint_id.txt
+    terraform output -raw jump_group_linux_id > linux_group_id.txt
+    if [ "$ENABLE_K8S_TUNNEL" = true ]; then
+        terraform output -raw linux_jumpoint_id > linux_jumpoint_id.txt
+    fi
+
+    # Track Terraform resources in state
+    add_resource_once "jump_group" "$(cat demo_group_id.txt)" "$JUMP_GROUP_DEMO" '{"type": "shared", "managed_by": "terraform"}'
+    add_resource_once "jump_group" "$(cat dc_group_id.txt)" "$JUMP_GROUP_DC" '{"type": "shared", "managed_by": "terraform"}'
+    add_resource_once "jump_group" "$(cat linux_group_id.txt)" "$JUMP_GROUP_LINUX" '{"type": "shared", "managed_by": "terraform"}'
+    add_resource_once "jumpoint" "$(cat jumpoint_id.txt)" "$JUMPOINT_NAME" '{"platform": "windows-x86", "managed_by": "terraform"}'
+    if [ "$ENABLE_K8S_TUNNEL" = true ]; then
+        add_resource_once "jumpoint" "$(cat linux_jumpoint_id.txt)" "$LINUX_JUMPOINT_NAME" '{"platform": "linux-x86", "managed_by": "terraform"}'
+    fi
+    popd > /dev/null
 }
 
 create_beyondtrust_api_helper() {
@@ -1705,6 +2579,49 @@ api_call_status() {
 
     curl "${args[@]}"
 }
+
+# Split the "body + trailing status line" produced by api_call_status
+http_body() { echo "$1" | sed '$d'; }
+http_code() { echo "$1" | tail -n1; }
+is_2xx() { case "$1" in 2??) return 0 ;; *) return 1 ;; esac; }
+
+# Limit a vault account to one jump item, matched by its exact name. An account level
+# association replaces the one inherited from the account group. POST is only accepted
+# while none is defined and PATCH only once one is, so try the likely verb first and fall
+# back to the other. If both fail the account keeps its account group's association.
+associate_vault_account() {
+    local account_id="$1"
+    local item_name="$2"
+    local endpoint="/vault/account/$account_id/jump-item-association"
+    local payload response code verb
+
+    # All five criteria arrays must be present; null is rejected
+    payload=$(jq -n --arg item "$item_name" '{
+        filter_type: "criteria",
+        criteria: {shared_jump_groups: [], host: [], name: [$item], tag: [], comment: []},
+        jump_items: []
+    }')
+
+    response=$(api_call_status "GET" "$endpoint" "")
+    if [ "$(http_code "$response")" = "404" ]; then verb="POST"; else verb="PATCH"; fi
+
+    response=$(api_call_status "$verb" "$endpoint" "$payload")
+    code=$(http_code "$response")
+    if ! is_2xx "$code"; then
+        if [ "$verb" = "POST" ]; then verb="PATCH"; else verb="POST"; fi
+        response=$(api_call_status "$verb" "$endpoint" "$payload")
+        code=$(http_code "$response")
+    fi
+
+    if is_2xx "$code"; then
+        echo "  Associated vault account $account_id with \"$item_name\" only"
+        return 0
+    fi
+    echo "  WARNING: Could not associate vault account $account_id with \"$item_name\" - HTTP $code"
+    echo "           API response: $(http_body "$response")"
+    echo "           The account keeps its account group's jump item association instead."
+    return 1
+}
 EOF
     
     chmod +x beyondtrust/scripts/bt-api.sh
@@ -1759,6 +2676,80 @@ get_bt_resources() {
     
     if [ -f "$STATE_FILE" ]; then
         jq -r --arg type "$resource_type" '.resources[$type][]? | .id' "$STATE_FILE"
+    fi
+}
+
+# Print the ID most recently recorded for a resource of this type whose field matches,
+# e.g. find_bt_resource jump_policy type approval_required. Objects this deployment made
+# are always found through the state file, never by name through the API: on a shared
+# tenant someone else's deployment can own an object with exactly the same name.
+find_bt_resource() {
+    local resource_type="$1"
+    local field="$2"
+    local value="$3"
+
+    if [ -f "$STATE_FILE" ]; then
+        jq -r --arg type "$resource_type" --arg field "$field" --arg value "$value" \
+            '[.resources[$type][]? | select(.[$field] == $value) | .id] | last // empty' "$STATE_FILE"
+    fi
+}
+
+# Remove a resource from the state file, e.g. one that was deleted in the console
+remove_bt_resource() {
+    local resource_type="$1"
+    local resource_id="$2"
+
+    [ -f "$STATE_FILE" ] || return 0
+    jq --arg type "$resource_type" --arg id "$resource_id" \
+       'if .resources[$type] then .resources[$type] |= map(select(.id != $id)) else . end' \
+       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+}
+
+# Print the ID of a prerequisite this deployment created: the file 'terraform output'
+# wrote if it holds a number, otherwise the state file
+known_bt_id() {
+    local file="$1"
+    local resource_type="$2"
+    local field="$3"
+    local value="$4"
+    local id=""
+
+    if [ -f "$file" ]; then
+        id=$(tr -d '[:space:]' < "$file")
+    fi
+    if ! echo "$id" | grep -qE '^[0-9]+$'; then
+        id=$(find_bt_resource "$resource_type" "$field" "$value")
+    fi
+    echo "$id"
+}
+
+# Check whether an object this deployment recorded earlier still exists, so re-runs reuse
+# it instead of creating a duplicate. Sets BT_ID and BT_BODY when it does. Returns 1 only
+# when the check itself failed (e.g. 401 or an outage), so that never creates a duplicate.
+# Needs bt-api.sh sourced first.
+find_existing_bt_object() {
+    local state_type="$1"
+    local name="$2"
+    local endpoint="$3"
+    local id response code
+
+    BT_ID=""
+    BT_BODY=""
+    id=$(find_bt_resource "$state_type" "name" "$name")
+    [ -n "$id" ] || return 0
+
+    response=$(api_call_status "GET" "$endpoint/$id" "")
+    code=$(http_code "$response")
+    if is_2xx "$code"; then
+        BT_ID="$id"
+        BT_BODY=$(http_body "$response")
+    elif [ "$code" = "404" ]; then
+        echo "  $name (ID: $id) no longer exists, it will be created again"
+        remove_bt_resource "$state_type" "$id"
+    else
+        echo "  ERROR: Could not check $name (ID: $id) - HTTP $code"
+        echo "         API response: $(http_body "$response")"
+        return 1
     fi
 }
 EOF
@@ -2641,6 +3632,369 @@ EOF
     chmod +x beyondtrust/scripts/configure-vault.sh
 }
 
+create_beyondtrust_ssh_ca_script() {
+    print_status "Creating SSH certificate login script..."
+
+    cat > beyondtrust/scripts/configure-ssh-ca.sh << 'EOF'
+#!/bin/bash
+# Certificate login for Ubuntu01 through a PRA Vault SSH CA
+#
+# Usage:
+#   ./configure-ssh-ca.sh account     Create (or reuse) the SSH CA vault account and write its
+#                                     public key to ../downloads/pra-ssh-ca.pub
+#   ./configure-ssh-ca.sh jump-item   Create (or reuse) the certificate Shell Jump and limit
+#                                     the SSH CA account to it
+#
+# deploy-infra.sh runs "account", installs the key on Ubuntu01, then runs "jump-item", so the
+# jump item only appears once the server trusts the CA. Safe to re-run: objects recorded in
+# the state file are reused. Payloads are built with jq -n here because some values (keys)
+# contain characters that the heredoc style used elsewhere would not escape.
+
+source "$(dirname "${BASH_SOURCE[0]}")/bt-api.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/state-helper.sh"
+
+CERT_USER="${LINUX_CERT_USERNAME:-certadmin}"
+ACCOUNT_NAME="${RESOURCE_PREFIX}Ubuntu01 Cert Admin (SSH CA)"
+ITEM_NAME="${RESOURCE_PREFIX}Ubuntu01 - SSH (Certificate)"
+CA_PUB_FILE="../downloads/pra-ssh-ca.pub"
+UBUNTU_PRIVATE_IP="10.0.3.10"
+
+# Create the SSH CA account. Vault generates the CA key pair itself when no private key is
+# supplied; if this version insists on one, upload a key generated here instead and delete
+# the local copy straight away. Sets ACCOUNT_ID and PUBLIC_KEY.
+create_ssh_ca_account() {
+    local base response code key_type tmp_dir payload
+
+    base=$(jq -n --arg name "$ACCOUNT_NAME" --arg user "$CERT_USER" \
+        --argjson group "${VAULT_ACCOUNT_GROUP_ID:-4}" '{
+        type: "ssh_ca",
+        name: $name,
+        username: $user,
+        description: "Certificate authority trusted by Ubuntu01. PRA signs a short lived certificate for each session; the Linux account has no password.",
+        account_group_id: $group
+    }')
+
+    response=$(api_call_status "POST" "/vault/account" "$base")
+    code=$(http_code "$response")
+
+    if ! is_2xx "$code" && [ "$code" != "401" ] && [ "$code" != "403" ] \
+        && command -v ssh-keygen > /dev/null 2>&1; then
+        echo "  Vault did not generate a CA key (HTTP $code), uploading one generated locally instead"
+        for key_type in ed25519 rsa; do
+            tmp_dir=$(mktemp -d)
+            if [ "$key_type" = "ed25519" ]; then
+                ssh-keygen -q -t ed25519 -N '' -C "$ACCOUNT_NAME" -f "$tmp_dir/ca"
+            else
+                ssh-keygen -q -t rsa -b 3072 -m PEM -N '' -C "$ACCOUNT_NAME" -f "$tmp_dir/ca"
+            fi
+            payload=$(echo "$base" | jq --rawfile key "$tmp_dir/ca" '. + {private_key: $key}')
+            rm -rf "$tmp_dir"
+            response=$(api_call_status "POST" "/vault/account" "$payload")
+            code=$(http_code "$response")
+            is_2xx "$code" && break
+        done
+    fi
+
+    if ! is_2xx "$code"; then
+        echo "  ERROR: Failed to create the SSH CA vault account - HTTP $code"
+        echo "         API response: $(http_body "$response")"
+        echo "         SSH CA accounts need PRA 23.3.1 or later, and the API account needs"
+        echo "         Manage Vault Accounts (Management -> API Configuration)."
+        return 1
+    fi
+
+    ACCOUNT_ID=$(http_body "$response" | jq -r '.id // empty')
+    PUBLIC_KEY=$(http_body "$response" | jq -r '.public_key // empty')
+    if [ -z "$ACCOUNT_ID" ]; then
+        echo "  ERROR: PRA accepted the SSH CA account but returned no ID"
+        return 1
+    fi
+    add_bt_resource "vault_account" "$ACCOUNT_ID" "$ACCOUNT_NAME" \
+        '{"username": "'"$CERT_USER"'", "type": "ssh_ca"}'
+    echo "  Created SSH CA vault account ID: $ACCOUNT_ID"
+}
+
+ensure_ssh_ca_account() {
+    echo "Creating SSH CA vault account for $CERT_USER on Ubuntu01..."
+
+    find_existing_bt_object "vault_account" "$ACCOUNT_NAME" "/vault/account" || return 1
+    if [ -n "$BT_ID" ]; then
+        ACCOUNT_ID="$BT_ID"
+        PUBLIC_KEY=$(echo "$BT_BODY" | jq -r '.public_key // empty')
+        echo "  Reusing SSH CA vault account ID: $ACCOUNT_ID"
+    else
+        create_ssh_ca_account || return 1
+    fi
+
+    # PRA returns the key in authorized_keys form ("cert-authority ssh-ed25519 AAAA...").
+    # TrustedUserCAKeys wants the bare key, and sshd skips the whole file when a line does
+    # not start with a key type, so keep only the type and the base64 blob.
+    local ca_key
+    ca_key=$(echo "$PUBLIC_KEY" \
+        | grep -oE '(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+=*' | head -1)
+    if [ -z "$ca_key" ]; then
+        echo "  ERROR: PRA returned no usable public key for vault account $ACCOUNT_ID: ${PUBLIC_KEY:-<empty>}"
+        return 1
+    fi
+
+    echo "$ca_key" > "$CA_PUB_FILE"
+    echo "  CA public key saved to $CA_PUB_FILE ($(echo "$ca_key" | cut -d' ' -f1))"
+}
+
+ensure_cert_shell_jump() {
+    local jumpoint_id linux_group_id policy_id account_id payload response code
+
+    jumpoint_id=$(known_bt_id ../terraform/jumpoint_id.txt "jumpoint" "platform" "windows-x86")
+    linux_group_id=$(known_bt_id ../terraform/linux_group_id.txt "jump_group" "name" "$JUMP_GROUP_LINUX")
+    # approval_policy.json can hold an error body after a re-run, so use the state file
+    policy_id=$(find_bt_resource "jump_policy" "type" "approval_required")
+    account_id=$(find_bt_resource "vault_account" "name" "$ACCOUNT_NAME")
+
+    if ! echo "$jumpoint_id $linux_group_id $policy_id $account_id" \
+        | grep -qE '^[0-9]+ [0-9]+ [0-9]+ [0-9]+$'; then
+        echo "  ERROR: Missing IDs (Jumpoint '$jumpoint_id', Linux group '$linux_group_id'," \
+            "approval policy '$policy_id', SSH CA account '$account_id')."
+        echo "         Run the full deployment first, then './configure-ssh-ca.sh account'."
+        return 1
+    fi
+
+    echo "Creating certificate Shell Jump Item for Ubuntu01..."
+    find_existing_bt_object "jump_item_shell" "$ITEM_NAME" "/jump-item/shell-jump" || return 1
+    if [ -n "$BT_ID" ]; then
+        echo "  Reusing shell jump item ID: $BT_ID"
+    else
+        payload=$(jq -n --arg name "$ITEM_NAME" --arg host "$UBUNTU_PRIVATE_IP" --arg user "$CERT_USER" \
+            --argjson jumpoint "$jumpoint_id" --argjson group "$linux_group_id" --argjson policy "$policy_id" '{
+            name: $name,
+            hostname: $host,
+            port: 22,
+            protocol: "ssh",
+            jumpoint_id: $jumpoint,
+            jump_group_id: $group,
+            jump_group_type: "shared",
+            username: $user,
+            terminal: "xterm",
+            jump_policy_id: $policy,
+            tag: "ssh-certificate",
+            comments: "Ubuntu01 with a PRA signed certificate. Choose the SSH CA credential; the account has no password."
+        }')
+
+        response=$(api_call_status "POST" "/jump-item/shell-jump" "$payload")
+        code=$(http_code "$response")
+        BT_ID=$(http_body "$response" | jq -r '.id // empty' 2>/dev/null)
+        if ! is_2xx "$code" || [ -z "$BT_ID" ]; then
+            echo "  ERROR: Failed to create the certificate Shell Jump item - HTTP $code"
+            echo "         API response: $(http_body "$response")"
+            return 1
+        fi
+        add_bt_resource "jump_item_shell" "$BT_ID" "$ITEM_NAME" \
+            "{\"hostname\": \"$UBUNTU_PRIVATE_IP\", \"type\": \"shell_jump_certificate\"}"
+        echo "  Created shell jump item ID: $BT_ID"
+    fi
+
+    # Offer the SSH CA credential on this jump item only. A failure here is not fatal: the
+    # account then follows its account group's association, which is how the other demo
+    # accounts are offered.
+    associate_vault_account "$account_id" "$ITEM_NAME" || true
+}
+
+main() {
+    case "$1" in
+        account)   ensure_ssh_ca_account ;;
+        jump-item) ensure_cert_shell_jump ;;
+        *)         echo "Usage: $0 account|jump-item"; return 1 ;;
+    esac
+}
+
+# Only run when executed, so the functions can be sourced for testing
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@" || exit 1
+fi
+EOF
+
+    chmod +x beyondtrust/scripts/configure-ssh-ca.sh
+}
+
+create_beyondtrust_k8s_tunnel_script() {
+    print_status "Creating Kubernetes tunnel script..."
+
+    cat > beyondtrust/scripts/configure-k8s-tunnel.sh << 'EOF'
+#!/bin/bash
+# Kubernetes Cluster Tunnel to the k3s cluster on Ubuntu01 through the Linux Jumpoint, and
+# the two service account tokens PRA injects into kubectl requests. The access console
+# gives the user a temporary kubeconfig; the tokens never reach their machine.
+#
+# Needs ../downloads/k8s-ca.pem, plus token-pra-admin and token-pra-readonly in
+# K8S_SECRETS_DIR, all written by deploy-infra.sh. Safe to re-run: objects recorded in the
+# state file are reused and their CA certificate and tokens refreshed. Payloads are built
+# with jq -n because the certificate is multi line and the tokens are long.
+
+source "$(dirname "${BASH_SOURCE[0]}")/bt-api.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/state-helper.sh"
+
+ITEM_NAME="${RESOURCE_PREFIX}Ubuntu01 - Kubernetes (k3s)"
+K8S_URL="https://10.0.3.10:6443"
+CA_FILE="../downloads/k8s-ca.pem"
+
+# Create (or reuse) the tunnel. Sets ITEM_ID.
+ensure_k8s_tunnel() {
+    local jumpoint_id linux_group_id policy_id payload response code attempt
+
+    jumpoint_id=$(known_bt_id ../terraform/linux_jumpoint_id.txt "jumpoint" "platform" "linux-x86")
+    linux_group_id=$(known_bt_id ../terraform/linux_group_id.txt "jump_group" "name" "$JUMP_GROUP_LINUX")
+    # approval_policy.json can hold an error body after a re-run, so use the state file
+    policy_id=$(find_bt_resource "jump_policy" "type" "approval_required")
+
+    if ! echo "$jumpoint_id $linux_group_id $policy_id" | grep -qE '^[0-9]+ [0-9]+ [0-9]+$'; then
+        echo "  ERROR: Missing IDs (Linux Jumpoint '$jumpoint_id', Linux group '$linux_group_id'," \
+            "approval policy '$policy_id'). Run the full deployment or --k8s-only first."
+        return 1
+    fi
+    if ! grep -q 'BEGIN CERTIFICATE' "$CA_FILE" 2>/dev/null; then
+        echo "  ERROR: No cluster CA certificate at $CA_FILE"
+        return 1
+    fi
+
+    echo "Creating Kubernetes Cluster Tunnel Jump Item for Ubuntu01..."
+    find_existing_bt_object "jump_item_k8s_tunnel" "$ITEM_NAME" "/jump-item/protocol-tunnel-jump" || return 1
+    if [ -n "$BT_ID" ]; then
+        ITEM_ID="$BT_ID"
+        # Keep the CA current in case k3s was reinstalled
+        payload=$(jq -n --arg url "$K8S_URL" --rawfile ca "$CA_FILE" '{url: $url, ca_certificates: $ca}')
+        response=$(api_call_status "PATCH" "/jump-item/protocol-tunnel-jump/$ITEM_ID" "$payload")
+        if is_2xx "$(http_code "$response")"; then
+            echo "  Reusing tunnel jump item ID: $ITEM_ID (cluster CA refreshed)"
+        else
+            echo "  Reusing tunnel jump item ID: $ITEM_ID (WARNING: could not refresh its CA, HTTP $(http_code "$response"))"
+        fi
+        return 0
+    fi
+
+    payload=$(jq -n --arg name "$ITEM_NAME" --arg url "$K8S_URL" --rawfile ca "$CA_FILE" \
+        --argjson jumpoint "$jumpoint_id" --argjson group "$linux_group_id" --argjson policy "$policy_id" '{
+        name: $name,
+        tunnel_type: "k8s",
+        url: $url,
+        ca_certificates: $ca,
+        jumpoint_id: $jumpoint,
+        jump_group_id: $group,
+        jump_group_type: "shared",
+        jump_policy_id: $policy,
+        session_policy_id: null,
+        tag: "kubernetes",
+        comments: "k3s on Ubuntu01. Choose a token credential, then run kubectl with the kubeconfig the console shows."
+    }')
+
+    # The Linux Jumpoint may still be connecting for the first time, so allow a short retry
+    for attempt in 1 2 3; do
+        response=$(api_call_status "POST" "/jump-item/protocol-tunnel-jump" "$payload")
+        code=$(http_code "$response")
+        if is_2xx "$code" || [ "$code" = "401" ] || [ "$code" = "403" ] || [ "$attempt" -eq 3 ]; then
+            break
+        fi
+        echo "  Tunnel not accepted yet (HTTP $code), retrying in 20s ($attempt/3)..."
+        sleep 20
+    done
+
+    ITEM_ID=$(http_body "$response" | jq -r '.id // empty' 2>/dev/null)
+    if ! is_2xx "$code" || [ -z "$ITEM_ID" ]; then
+        echo "  ERROR: Failed to create the Kubernetes tunnel jump item - HTTP $code"
+        echo "         API response: $(http_body "$response")"
+        echo "         Kubernetes tunnels need PRA 24.1.1 or later and a connected Linux Jumpoint."
+        return 1
+    fi
+    add_bt_resource "jump_item_k8s_tunnel" "$ITEM_ID" "$ITEM_NAME" \
+        "{\"url\": \"$K8S_URL\", \"type\": \"k8s_tunnel\"}"
+    echo "  Created tunnel jump item ID: $ITEM_ID"
+}
+
+# Create (or refresh the token of) one vault token account. Sets TOKEN_ACCOUNT_ID.
+ensure_token_account() {
+    local name="$1"
+    local token_file="$2"
+    local description="$3"
+    local token payload response code
+
+    echo "Creating Kubernetes token vault account: $name"
+    token=""
+    if [ -s "$token_file" ]; then
+        token=$(tr -d '[:space:]' < "$token_file")
+    fi
+    if [ -z "$token" ] || [ "${#token}" -gt 4096 ]; then
+        echo "  ERROR: No usable token in $token_file (the vault accepts up to 4096 characters)"
+        return 1
+    fi
+
+    find_existing_bt_object "vault_account" "$name" "/vault/account" || return 1
+    if [ -n "$BT_ID" ]; then
+        TOKEN_ACCOUNT_ID="$BT_ID"
+        # Refresh the token in case the cluster was rebuilt
+        payload=$(jq -n --arg token "$token" '{type: "opaque_token", token: $token}')
+        response=$(api_call_status "PATCH" "/vault/account/$TOKEN_ACCOUNT_ID" "$payload")
+        if is_2xx "$(http_code "$response")"; then
+            echo "  Reusing vault account ID: $TOKEN_ACCOUNT_ID (token refreshed)"
+        else
+            echo "  Reusing vault account ID: $TOKEN_ACCOUNT_ID (WARNING: could not refresh its token, HTTP $(http_code "$response"))"
+        fi
+        return 0
+    fi
+
+    payload=$(jq -n --arg name "$name" --arg token "$token" --arg desc "$description" \
+        --argjson group "${VAULT_ACCOUNT_GROUP_ID:-4}" '{
+        type: "opaque_token",
+        name: $name,
+        token: $token,
+        description: $desc,
+        account_group_id: $group
+    }')
+    response=$(api_call_status "POST" "/vault/account" "$payload")
+    code=$(http_code "$response")
+    TOKEN_ACCOUNT_ID=$(http_body "$response" | jq -r '.id // empty' 2>/dev/null)
+    if ! is_2xx "$code" || [ -z "$TOKEN_ACCOUNT_ID" ]; then
+        echo "  ERROR: Failed to create vault account $name - HTTP $code"
+        echo "         API response: $(http_body "$response")"
+        return 1
+    fi
+    add_bt_resource "vault_account" "$TOKEN_ACCOUNT_ID" "$name" '{"type": "opaque_token"}'
+    echo "  Created vault account ID: $TOKEN_ACCOUNT_ID"
+}
+
+main() {
+    local failed=0
+
+    if [ -z "$K8S_SECRETS_DIR" ] || [ ! -d "$K8S_SECRETS_DIR" ]; then
+        echo "ERROR: K8S_SECRETS_DIR is not set. Run this through './deploy-infra.sh --k8s-only'."
+        return 1
+    fi
+
+    ensure_k8s_tunnel || return 1
+
+    if ensure_token_account "${RESOURCE_PREFIX}K8s Admin (cluster-admin)" "$K8S_SECRETS_DIR/token-pra-admin" \
+        "Service account pra-demo/pra-admin, bound to cluster-admin on the k3s cluster on Ubuntu01. PRA injects it into kubectl requests."; then
+        associate_vault_account "$TOKEN_ACCOUNT_ID" "$ITEM_NAME" || true
+    else
+        failed=1
+    fi
+
+    if ensure_token_account "${RESOURCE_PREFIX}K8s Read Only (view)" "$K8S_SECRETS_DIR/token-pra-readonly" \
+        "Service account pra-demo/pra-readonly, bound to the view ClusterRole (read only, no secrets) on the k3s cluster on Ubuntu01."; then
+        associate_vault_account "$TOKEN_ACCOUNT_ID" "$ITEM_NAME" || true
+    else
+        failed=1
+    fi
+
+    [ "$failed" -eq 0 ]
+}
+
+# Only run when executed, so the functions can be sourced for testing
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@" || exit 1
+fi
+EOF
+
+    chmod +x beyondtrust/scripts/configure-k8s-tunnel.sh
+}
+
 create_beyondtrust_cleanup_script() {
     print_status "Creating cleanup script..."
     
@@ -2679,6 +4033,20 @@ cleanup_jump_items() {
         done
     else
         echo "  No MSSQL tunnel jump items found in state file"
+    fi
+
+    # Clean up Kubernetes tunnel jump items. These use the Linux Jumpoint, so they must go
+    # before terraform destroy removes it.
+    local k8s_item_ids=$(get_bt_resources "jump_item_k8s_tunnel")
+    if [ -n "$k8s_item_ids" ]; then
+        echo "$k8s_item_ids" | while read -r item_id; do
+            if [ -n "$item_id" ]; then
+                echo "  Deleting Kubernetes tunnel jump item: $item_id"
+                api_call "DELETE" "/jump-item/protocol-tunnel-jump/$item_id" "" || echo "    Failed to delete Kubernetes tunnel jump item $item_id"
+            fi
+        done
+    else
+        echo "  No Kubernetes tunnel jump items found in state file"
     fi
 
     # Clean up Shell Jump items (Linux/Ubuntu)
@@ -3472,6 +4840,15 @@ cleanup_all() {
         fi
     fi
     
+    # Regenerate the cleanup script so it knows every resource type this version creates,
+    # even when the deployment was made with an older copy of this script
+    if [ -f "$PROJECT_DIR/beyondtrust/scripts/cleanup-resources.sh" ]; then
+        create_beyondtrust_api_helper
+        create_beyondtrust_state_helper
+        create_beyondtrust_run_wrapper
+        create_beyondtrust_cleanup_script
+    fi
+
     # Step 1: Clean up BeyondTrust API resources first
     if [ -d "$PROJECT_DIR/beyondtrust/scripts" ] && [ -f "$PROJECT_DIR/beyondtrust/scripts/cleanup-resources.sh" ]; then
         print_status "Cleaning up BeyondTrust API resources..."
@@ -3489,7 +4866,9 @@ cleanup_all() {
     # Step 2: Destroy BeyondTrust Terraform resources
     if [ -d "$PROJECT_DIR/beyondtrust/terraform" ] && [ -f "$PROJECT_DIR/beyondtrust/terraform/terraform.tfstate" ]; then
         print_status "Destroying BeyondTrust Terraform resources..."
-        (cd "$PROJECT_DIR/beyondtrust/terraform" && terraform destroy -auto-approve)
+        # Carry on to the Azure resources even if this fails, so the VMs stop billing
+        (cd "$PROJECT_DIR/beyondtrust/terraform" && terraform destroy -auto-approve) || \
+            print_warning "BeyondTrust Terraform destroy failed, see above. Continuing with Azure; run ./deploy-infra.sh --cleanup again afterwards to retry it."
     fi
 
     # Step 3: Destroy Azure infrastructure
@@ -3522,6 +4901,8 @@ cleanup_all() {
     rm -f beyondtrust/downloads/*.msi
     rm -f beyondtrust/downloads/*.txt
     rm -f beyondtrust/downloads/*.json
+    rm -f beyondtrust/downloads/*.pem
+    rm -f beyondtrust/downloads/*.pub
     
     # Step 5: Archive state file
     if [ -f "$STATE_FILE" ]; then
@@ -3573,6 +4954,16 @@ main() {
         exit 0
     fi
 
+    # Add one optional feature to an existing deployment
+    if [ "$SSH_CA_ONLY" = true ]; then
+        run_ssh_ca_only
+        exit 0
+    fi
+    if [ "$K8S_ONLY" = true ]; then
+        run_k8s_only
+        exit 0
+    fi
+
     # Install prerequisites
     install_prerequisites
     
@@ -3612,16 +5003,38 @@ main() {
         echo "  Group Policy: ID $GROUP_POLICY_ID - ASSIGNMENT FAILED, asset groups are NOT assigned"
         echo "                Re-run with: ./deploy-infra.sh --group-policy-only"
     fi
-    echo "  Jumpoint: $JUMPOINT_NAME on DC01"
+    if [ "$ENABLE_K8S_TUNNEL" = true ]; then
+        echo "  Jumpoints: $JUMPOINT_NAME on DC01, $LINUX_JUMPOINT_NAME on Ubuntu01 (Kubernetes tunnel)"
+    else
+        echo "  Jumpoint: $JUMPOINT_NAME on DC01"
+    fi
     echo "  Jump Items: RDP access to DC01 and SQL01, MSSQL tunnel to SQL01, SSH Shell Jump to Ubuntu01"
     echo "  Vault Accounts (Windows): $DOMAIN_NETBIOS_NAME\\testadmin, $DOMAIN_NETBIOS_NAME\\jsmith, $DOMAIN_NETBIOS_NAME\\mjohnson, $DOMAIN_NETBIOS_NAME\\bdavis"
     echo "  Vault Accounts (Linux): linuxadmin (local Ubuntu account)"
+    case "${SSH_CA_CONFIGURED:-skipped}" in
+        true)
+            echo "  SSH Certificate Login: ${RESOURCE_PREFIX}Ubuntu01 - SSH (Certificate), SSH CA vault account for $LINUX_CERT_USERNAME (no password on Ubuntu01)" ;;
+        false)
+            echo "  SSH Certificate Login: NOT configured, re-run with: ./deploy-infra.sh --ssh-ca-only" ;;
+    esac
+    case "${K8S_TUNNEL_CONFIGURED:-skipped}" in
+        true)
+            echo "  Kubernetes Tunnel: ${RESOURCE_PREFIX}Ubuntu01 - Kubernetes (k3s), token vault accounts K8s Admin (cluster-admin) and K8s Read Only (view)" ;;
+        false)
+            echo "  Kubernetes Tunnel: NOT configured, re-run with: ./deploy-infra.sh --k8s-only" ;;
+    esac
     echo ""
     echo "Access Patterns:"
     echo "  Direct to DC01: Console → Jump Clients → DC01-JumpClient"
     echo "  Approved to SQL01: Console → Jump Items → SQL01 → Request approval"
     echo "  SSH to Ubuntu01 via Jumpoint: Console → Jump Items → Linux Servers → Ubuntu01 - SSH"
     echo "  Ubuntu01 Jump Client: Console → Jump → Linux Servers → Ubuntu01_JumpClient"
+    if [ "${SSH_CA_CONFIGURED:-skipped}" = true ]; then
+        echo "  SSH with a certificate: Console → Jump Items → Linux Servers → Ubuntu01 - SSH (Certificate) → choose the SSH CA credential"
+    fi
+    if [ "${K8S_TUNNEL_CONFIGURED:-skipped}" = true ]; then
+        echo "  kubectl through PRA: Console → Jump Items → Linux Servers → Ubuntu01 - Kubernetes (k3s) → choose a token, then run kubectl with the kubeconfig the console shows"
+    fi
     echo "  Approver: $APPROVER_EMAIL"
     echo ""
     echo "Demo Users (all have RDP access):"

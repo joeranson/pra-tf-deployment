@@ -1,6 +1,6 @@
 # BeyondTrust PRA Demo Environment
 
-Automated deployment of a complete BeyondTrust Privileged Remote Access (PRA) demo environment on Microsoft Azure. The scripts provision Azure infrastructure (Active Directory domain controller and SQL Server), then configure BeyondTrust PRA with jump items, vault accounts, and access policies.
+Automated deployment of a complete BeyondTrust Privileged Remote Access (PRA) demo environment on Microsoft Azure. The scripts provision Azure infrastructure (Active Directory domain controller, SQL Server and an Ubuntu server running a small Kubernetes cluster), then configure BeyondTrust PRA with jump items, vault accounts, and access policies, including SSH certificate login through the PRA Vault SSH CA and kubectl access through a Kubernetes Cluster Tunnel.
 
 ---
 
@@ -11,15 +11,18 @@ Automated deployment of a complete BeyondTrust Privileged Remote Access (PRA) de
   - Domain Controller VM (DC01) — Windows Server with Active Directory (public IP)
   - SQL Server VM (SQL01) — Windows Server with SQL Server 2022 Developer Edition
   - Ubuntu VM (Ubuntu01) — Ubuntu 24.04 LTS with BeyondTrust Jump Client (public IP)
-  - Network security groups with appropriate firewall rules
+    - Single node k3s Kubernetes cluster with a small demo app, and the Linux Jumpoint that reaches it
+    - A `certadmin` user with no password that only accepts certificates signed by the PRA Vault SSH CA
+  - Network security groups with appropriate firewall rules. The Kubernetes API (6443) and kubelet (10250) ports on Ubuntu01 are closed to the network entirely, so the cluster is only reachable through PRA.
 
 - **BeyondTrust PRA Configuration**
-  - Jumpoint installed on DC01
+  - Jumpoint installed on DC01, plus a Linux Jumpoint on Ubuntu01 (PRA only runs the Kubernetes Cluster Tunnel through a Linux Jumpoint)
   - Jump groups (asset groups) for demo servers, domain controllers, and Linux servers
   - All three asset groups assigned to a group policy (default: `administrators`, ID 2) so its members inherit access
-  - Jump items: SQL Server RDP, DC01 RDP, IIS Web Portal, MSSQL protocol tunnel, Ubuntu01 SSH Shell Jump, Ubuntu01 Jump Client
-  - Jump policies: approval-required (SQL + Linux) and direct access (DC)
+  - Jump items: SQL Server RDP, DC01 RDP, IIS Web Portal, MSSQL protocol tunnel, Ubuntu01 SSH Shell Jump, Ubuntu01 Jump Client, Ubuntu01 SSH Shell Jump with a certificate, and a Kubernetes Cluster Tunnel to the k3s cluster
+  - Jump policies: approval-required (SQL + Linux, including the certificate Shell Jump and the Kubernetes tunnel) and direct access (DC)
   - Vault accounts for domain admin, demo users (jsmith, mjohnson, bdavis), and Ubuntu local admin (linuxadmin)
+  - A Vault SSH CA account for `certadmin` on Ubuntu01, and two Kubernetes service account tokens: `K8s Admin (cluster-admin)` and `K8s Read Only (view)`
 
 - **Optional: RDS / RemoteApp** (via `--with-rds`)
   - RDS role on SQL01
@@ -35,7 +38,10 @@ You will need:
 - A Linux machine running a Debian/Ubuntu-based distribution (for `apt-get` based installs)
 - `sudo` access (to install system packages)
 - An active Azure subscription
-- A BeyondTrust PRA instance with API access enabled
+- A BeyondTrust PRA instance with API access enabled. SSH certificate login needs PRA 23.3.1 or later and the Kubernetes Cluster Tunnel needs 24.1.1 or later; turn either off in `config.env` for older instances.
+- An API account with *Configuration API*, *Manage Vault Accounts* and *Group Policy* permissions
+
+To demo the Kubernetes tunnel you also need `kubectl` on the machine that runs the PRA access console, and the PRA user needs the Protocol Tunnel Jump permission (Jump Technology, set on the user or on their group policy).
 
 ---
 
@@ -111,6 +117,17 @@ To see the group policies and jump item roles that exist on your instance — us
 ./deploy-infra.sh --group-policy-only --list
 ```
 
+### Step 7 (optional): Add certificate login or the Kubernetes tunnel to an existing deployment
+
+A full deployment sets both up. To add them to an environment you deployed before they existed, or to finish one that did not complete, run just that part. Both are safe to re-run: objects already created are reused rather than duplicated.
+
+```bash
+./deploy-infra.sh --ssh-ca-only   # PRA Vault SSH CA, certadmin on Ubuntu01, certificate Shell Jump
+./deploy-infra.sh --k8s-only      # Linux Jumpoint and k3s on Ubuntu01, Kubernetes tunnel, token accounts
+```
+
+Ubuntu01 must be running. These skip Azure, Terraform for the VMs and Ansible, except that `--k8s-only` applies the BeyondTrust Terraform to add the Linux Jumpoint and adds the NSG rule that closes the Kubernetes ports.
+
 ---
 
 ## Configuration Reference
@@ -154,6 +171,17 @@ All variables live in `~/beyondtrust-demo/config.env`.
 | `LINUX_ADMIN_USERNAME` | `linuxadmin` | Local administrator username for the Ubuntu VM |
 | `LINUX_ADMIN_PASSWORD` | `UbuntuPass123!` | Local administrator password for the Ubuntu VM |
 
+### SSH Certificate Login and Kubernetes Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_SSH_CA` | `true` | Set up certificate login for Ubuntu01 through a PRA Vault SSH CA. Needs PRA 23.3.1 or later. |
+| `LINUX_CERT_USERNAME` | `certadmin` | Ubuntu user created for certificate login. It has no password and passwordless sudo, and only accepts certificates PRA signs. Must be a new user, not `LINUX_ADMIN_USERNAME` or `root`. |
+| `ENABLE_K8S_TUNNEL` | `true` | Install k3s and a Linux Jumpoint on Ubuntu01 and create the Kubernetes Cluster Tunnel. Needs PRA 24.1.1 or later. |
+| `K3S_VERSION` | _(empty)_ | k3s release to install, for example `v1.33.4+k3s1`. Empty means the current stable release. |
+
+Config files created before these settings existed work unchanged: the defaults above apply.
+
 ### Demo User Configuration (optional)
 
 The following variables allow customisation of the demo user accounts created in the vault. They are commented out by default and the built-in defaults are used.
@@ -165,6 +193,22 @@ The following variables allow customisation of the demo user accounts created in
 ```
 
 Format: `username:FirstName:LastName:Password`
+
+---
+
+## Demo Walkthrough: Certificate Login and kubectl
+
+**SSH with a short lived certificate**
+1. In the access console, open Jump Items → Linux Servers → `Ubuntu01 - SSH (Certificate)` and request access; the approver gets the email.
+2. Once approved, start the session and choose the `Ubuntu01 Cert Admin (SSH CA)` credential. PRA signs a certificate for this session only (valid for five hours) and injects it; nobody sees a key or a password.
+3. You land on Ubuntu01 as `certadmin`. Show that the account has no password (`sudo passwd -S certadmin` reports `L`, locked) and no `~/.ssh/authorized_keys`, and that `sudo journalctl -u ssh -n 5` records the login as `Accepted publickey for certadmin ... ED25519-CERT ... CA ...`: a certificate signed by the PRA CA.
+4. The session is recorded like any other Shell Jump.
+
+**kubectl through PRA**
+1. Open `Ubuntu01 - Kubernetes (k3s)`, request access, and start it with the `K8s Read Only (view)` token.
+2. The console shows an environment variable and a command line argument pointing at a temporary kubeconfig. Run kubectl locally with either, e.g. `kubectl get pods -A`.
+3. `kubectl delete pod -n demo-apps --all` is refused (Forbidden): the read only token can look but not touch.
+4. End the session, start again with `K8s Admin (cluster-admin)`, and the same command works. The token never reaches your machine, the temporary kubeconfig is deleted when the session closes, and the Kubernetes API has no network exposure at all: the only way in is through the Jumpoint.
 
 ---
 
@@ -186,6 +230,8 @@ To remove all resources created by the deployment:
 ./deploy-infra.sh --cleanup
 ```
 
+This includes the Linux Jumpoint, the Kubernetes tunnel, the token accounts and the SSH CA account. Deleting that account deletes the CA itself, so nothing else can ever be trusted through it.
+
 
 ---
 
@@ -199,9 +245,13 @@ Azure Virtual Network (10.0.0.0/16)
 │   └── SQL01 (10.0.2.10) — SQL Server 2022
 └── Subnet 3 (10.0.3.0/24)
     └── Ubuntu01 (10.0.3.10) — Ubuntu 24.04 + Jump Client  [public IP]
+        ├── k3s (API on 6443, closed to the network by the NSG)
+        ├── Linux Jumpoint (reaches the k3s API locally)
+        └── certadmin (no password, trusts the PRA Vault SSH CA)
 
 BeyondTrust PRA
 ├── Jumpoint (on DC01) — proxies connections to internal resources
+├── Linux Jumpoint (on Ubuntu01): carries the Kubernetes Cluster Tunnel
 ├── Jump Groups (Asset Groups)
 │   ├── Demo Servers       — SQL01 jump items
 │   ├── Domain Controllers — DC01 jump items
@@ -214,9 +264,13 @@ BeyondTrust PRA
 │   ├── SQL DB Tunnel      — MSSQL protocol tunnel
 │   ├── DC01 RDP           — direct access policy
 │   ├── Ubuntu01 SSH       — Shell Jump via Jumpoint (approval-required)
+│   ├── Ubuntu01 SSH (Certificate): Shell Jump as certadmin with a PRA signed certificate (approval required)
+│   ├── Ubuntu01 Kubernetes (k3s): Kubernetes Cluster Tunnel via the Linux Jumpoint (approval required)
 │   └── Ubuntu01 JumpClient — Jump Client agent (direct session)
 └── Vault
-    └── Account Group → Domain Admin, jsmith, mjohnson, bdavis, linuxadmin
+    ├── Account Group → Domain Admin, jsmith, mjohnson, bdavis, linuxadmin
+    ├── SSH CA account → Ubuntu01 Cert Admin (offered on the certificate Shell Jump only)
+    └── Token accounts → K8s Admin (cluster-admin), K8s Read Only (view) (offered on the tunnel only)
 ```
 
 ---
@@ -252,4 +306,16 @@ A `403` means the API account cannot manage group policies — grant it *Group P
 **Ansible tasks time out connecting to VMs**
 The VMs need a few minutes after provisioning before WinRM is available. The script includes retry logic, but in some regions VMs start more slowly.
 
-Note that re-running `./deploy-infra.sh` repeats **every** phase — it re-runs `terraform apply` and all of the Ansible plays, and the BeyondTrust jump policies, jump items and vault accounts are created again rather than reused. The state file records what was created for cleanup; it is not used to skip completed steps. To redo only the group policy assignment, use `--group-policy-only`.
+**The summary says SSH certificate login or the Kubernetes tunnel is NOT configured**
+These steps never stop the rest of the deployment. Fix the cause shown in the output, then run `./deploy-infra.sh --ssh-ca-only` or `./deploy-infra.sh --k8s-only`. Anything on Ubuntu01 is logged in `/var/log/pra-demo/` on the VM. A `422` or `404` from the API usually means the PRA instance is older than the feature needs (23.3.1 for the SSH CA, 24.1.1 for the Kubernetes tunnel); set `ENABLE_SSH_CA` or `ENABLE_K8S_TUNNEL` to `false` to skip it.
+
+**The new credential does not appear when starting a session**
+Each new vault account is limited to its own jump item by name, and users only see accounts they may inject. The new accounts go into `VAULT_ACCOUNT_GROUP_ID`, so check that the group policy has access to that account group. If limiting an account to its jump item failed, the output says so and the account falls back to its account group's jump item association.
+
+**The certificate login is rejected**
+sshd only accepts a certificate whose principals include the login name, and the vault account's username is `LINUX_CERT_USERNAME`. To see what PRA signs, check the account out with `POST /api/config/v1/vault/account/{id}/check-out`, save `signed_public_cert` to a file and run `ssh-keygen -L -f` on it. On Ubuntu01, `sudo sshd -T | grep -i trustedusercakeys` should show `/etc/ssh/pra_user_ca.pub`, and `sudo journalctl -u ssh` shows why a login failed.
+
+**The Kubernetes tunnel does not connect**
+The Linux Jumpoint must be online in /login (Jump → Jumpoints). On Ubuntu01, check `sudo systemctl status pra-jumpoint` and `sudo /opt/beyondtrust/jumpoint/init-script status`; the install log is `/var/log/pra-demo/jumpoint.log`. For k3s, `sudo k3s kubectl get nodes` and `/var/log/pra-demo/k3s.log`. If k3s was rebuilt, run `./deploy-infra.sh --k8s-only` to refresh the cluster CA and tokens in PRA.
+
+Note that re-running `./deploy-infra.sh` repeats **every** phase: it re-runs `terraform apply` and all of the Ansible plays, and the BeyondTrust jump policies, jump items and vault accounts are created again rather than reused. The exceptions are the SSH certificate login and Kubernetes tunnel objects, which are reused (and their CA and tokens refreshed) when the state file shows they already exist. The state file records what was created for cleanup; it is not used to skip the other steps. To redo only the group policy assignment, use `--group-policy-only`.
