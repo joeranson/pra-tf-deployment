@@ -15,7 +15,8 @@ Automated deployment of a complete BeyondTrust Privileged Remote Access (PRA) de
 
 - **BeyondTrust PRA Configuration**
   - Jumpoint installed on DC01
-  - Jump groups for demo servers, domain controllers, and Linux servers
+  - Jump groups (asset groups) for demo servers, domain controllers, and Linux servers
+  - All three asset groups assigned to a group policy (default: `administrators`, ID 2) so its members inherit access
   - Jump items: SQL Server RDP, DC01 RDP, IIS Web Portal, MSSQL protocol tunnel, Ubuntu01 SSH Shell Jump, Ubuntu01 Jump Client
   - Jump policies: approval-required (SQL + Linux) and direct access (DC)
   - Vault accounts for domain admin, demo users (jsmith, mjohnson, bdavis), and Ubuntu local admin (linuxadmin)
@@ -94,6 +95,22 @@ To also publish SSMS as a RemoteApp through RDS on SQL01:
 ./deploy-infra.sh --with-rds
 ```
 
+### Step 6 (optional) — Re-run just the group policy assignment
+
+Assigning the asset groups to the group policy is idempotent and can be re-run on its own against an
+existing deployment, without touching Azure, Terraform or Ansible:
+
+```bash
+./deploy-infra.sh --group-policy-only
+```
+
+To see the group policies and jump item roles that exist on your instance — useful if the defaults of
+`2` don't match — run it in read-only mode:
+
+```bash
+./deploy-infra.sh --group-policy-only --list
+```
+
 ---
 
 ## Configuration Reference
@@ -122,6 +139,9 @@ All variables live in `~/beyondtrust-demo/config.env`.
 | `APPROVER_EMAIL` | _(empty)_ | Yes | Email for approval workflow notifications |
 | `RESOURCE_PREFIX` | `Demo_` | No | Prefix applied to all created BeyondTrust resources |
 | `VAULT_ACCOUNT_GROUP_ID` | `4` | Yes | Numeric ID of the vault account group that demo accounts are assigned to. Find it in BeyondTrust console → Vault → Account Groups. |
+| `GROUP_POLICY_ID` | `2` | No | Numeric ID of the group policy the asset (jump) groups are assigned to. `2` is the built-in `Administrator` policy. Find it with `--group-policy-only --list`, or in BeyondTrust console → Users & Security → Group Policies. |
+| `JUMP_ITEM_ROLE_ID` | _(empty)_ | No | Numeric ID of the jump item role granted to that group policy on the asset groups. Takes precedence over `JUMP_ITEM_ROLE_NAME` when set. Find it with `--group-policy-only --list`, or in BeyondTrust console → Jump → Jump Item Roles. |
+| `JUMP_ITEM_ROLE_NAME` | `Administrator` | No | Used when `JUMP_ITEM_ROLE_ID` is empty: the role is looked up by name. Role IDs differ between instances, names generally don't, so this is the portable option. |
 | `JUMP_GROUP_DEMO` | `Demo Servers` | No | Name of the jump group for demo servers |
 | `JUMP_GROUP_DC` | `Domain Controllers` | No | Name of the jump group for domain controllers |
 | `JUMP_GROUP_LINUX` | `Linux Servers` | No | Name of the jump group for Linux servers |
@@ -182,10 +202,12 @@ Azure Virtual Network (10.0.0.0/16)
 
 BeyondTrust PRA
 ├── Jumpoint (on DC01) — proxies connections to internal resources
-├── Jump Groups
+├── Jump Groups (Asset Groups)
 │   ├── Demo Servers       — SQL01 jump items
 │   ├── Domain Controllers — DC01 jump items
 │   └── Linux Servers      — Ubuntu01 jump items
+├── Group Policy (ID 2 — Administrator)
+│   └── all three asset groups assigned with the Administrator jump item role
 ├── Jump Items
 │   ├── SQL01 RDP          — approval-required policy
 │   ├── SQL01 IIS Web      — approval-required policy
@@ -205,10 +227,29 @@ BeyondTrust PRA
 Run `az login` manually before executing the script to pre-authenticate.
 
 **BeyondTrust API calls return 401**
-Verify `BT_CLIENT_ID` and `BT_CLIENT_SECRET` are correct and that the API account has *Configuration API* and *Manage Vault Accounts* permissions.
+Verify `BT_CLIENT_ID` and `BT_CLIENT_SECRET` are correct and that the API account has *Configuration API*, *Manage Vault Accounts* and *Group Policy* permissions.
 
 **Vault accounts fail to create**
 Confirm that `VAULT_ACCOUNT_GROUP_ID` matches an existing group in your BeyondTrust instance. The default value of `4` may not exist in your environment.
 
+**Asset groups are not assigned to the group policy**
+The assignment step reports the HTTP status and the API response for every failure, and exits non-zero if any group could not be assigned. Start by listing what actually exists on your instance:
+
+```bash
+./deploy-infra.sh --group-policy-only --list
+```
+
+Then set `GROUP_POLICY_ID` and `JUMP_ITEM_ROLE_ID` in `config.env` to match, and re-run:
+
+```bash
+./deploy-infra.sh --group-policy-only
+```
+
+If the asset groups end up with the wrong permissions — for example *Start Sessions Only* instead of *Administrator* — the jump item role is wrong. Jump item role IDs are **not** consistent between instances, so prefer leaving `JUMP_ITEM_ROLE_ID` empty and letting `JUMP_ITEM_ROLE_NAME` resolve it. Re-running after changing either value corrects groups that are already assigned; it does not silently skip them.
+
+A `403` means the API account cannot manage group policies — grant it *Group Policy* access under Configuration → API Accounts. A failed assignment no longer stops the rest of the deployment; it prints a warning and the final summary says the groups were not assigned.
+
 **Ansible tasks time out connecting to VMs**
-The VMs need a few minutes after provisioning before WinRM is available. The script includes retry logic, but in some regions VMs start more slowly. Re-running the script is safe — it uses state tracking to skip already-completed steps.
+The VMs need a few minutes after provisioning before WinRM is available. The script includes retry logic, but in some regions VMs start more slowly.
+
+Note that re-running `./deploy-infra.sh` repeats **every** phase — it re-runs `terraform apply` and all of the Ansible plays, and the BeyondTrust jump policies, jump items and vault accounts are created again rather than reused. The state file records what was created for cleanup; it is not used to skip completed steps. To redo only the group policy assignment, use `--group-policy-only`.
