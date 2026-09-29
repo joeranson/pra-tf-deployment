@@ -1584,13 +1584,22 @@ if [ ! -x "$JP_DIR/init-script" ] || [ "$(cat "$JP_DIR/.pra-jumpoint-id" 2>/dev/
     # this release does not know are skipped rather than failing the whole install.
     export DEBIAN_FRONTEND=noninteractive
     APT="apt-get -o DPkg::Lock::Timeout=300 -y -q --no-install-recommends"
-    apt-get -o DPkg::Lock::Timeout=300 -q update >>"$LOG" 2>&1
+    # apt is chatty, so it gets its own log and the failure output shows the installer instead
+    APT_LOG=/var/log/pra-demo/jumpoint-apt.log
+    apt-get -o DPkg::Lock::Timeout=300 -q update >>"$APT_LOG" 2>&1
     BASE_PKGS=""
+    # The web engine (sra-web) also needs the GTK 3 and Chromium runtime stack. Both the
+    # older and the t64 package names are listed; apt-cache drops whichever does not exist.
     for p in libpulse0 libglx0 libgl1 libegl1 libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 \
-        libfreetype6 libx11-6 libx11-xcb1 libxcb1 libxext6 libxrender1 libdbus-1-3; do
+        libfreetype6 libx11-6 libx11-xcb1 libxcb1 libxext6 libxrender1 libdbus-1-3 \
+        libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 libgtk-3-0 libgtk-3-0t64 \
+        libatk1.0-0 libatk1.0-0t64 libatk-bridge2.0-0 libatk-bridge2.0-0t64 libglib2.0-0 \
+        libglib2.0-0t64 libnss3 libnspr4 libasound2 libasound2t64 libcups2 libcups2t64 libgbm1 \
+        libdrm2 libxshmfence1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libxi6 libxinerama1 \
+        libxrandr2 libxss1 libxtst6 libexpat1 fonts-liberation; do
         if apt-cache show "$p" >/dev/null 2>&1; then BASE_PKGS="$BASE_PKGS $p"; fi
     done
-    $APT install $BASE_PKGS >>"$LOG" 2>&1 || fail "could not install the Jumpoint's libraries"
+    $APT install $BASE_PKGS >>"$APT_LOG" 2>&1 || fail "could not install the Jumpoint's libraries (see $APT_LOG)"
 
     # The loader only names the first missing library, so install whatever the installer
     # reports and try again, a bounded number of times
@@ -1616,10 +1625,10 @@ if [ ! -x "$JP_DIR/init-script" ] || [ "$(cat "$JP_DIR/.pra-jumpoint-id" 2>/dev/
 
         [ -n "$LIB" ] || fail "installer exited with status $RC"
         [ "$LIB" != "$LAST_LIB" ] || fail "missing library $LIB is still missing after installing its package"
-        [ "$TRIES" -lt 8 ] || fail "libraries still missing after $TRIES attempts (last: $LIB)"
+        [ "$TRIES" -lt 30 ] || fail "libraries still missing after $TRIES attempts (last: $LIB)"
         PKG=$(pkg_for_lib "$LIB") || fail "missing library $LIB, no package found for it"
         echo "Installing $PKG for $LIB" >>"$LOG"
-        $APT install "$PKG" >>"$LOG" 2>&1 || fail "could not install $PKG for $LIB"
+        $APT install "$PKG" >>"$APT_LOG" 2>&1 || fail "could not install $PKG for $LIB (see $APT_LOG)"
         EXTRA_PKGS="$EXTRA_PKGS $PKG"
         LAST_LIB="$LIB"
     done
