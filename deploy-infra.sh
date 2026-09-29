@@ -1541,6 +1541,17 @@ fail() {
 }
 LIBS_NOTE=""
 
+export DEBIAN_FRONTEND=noninteractive
+APT="apt-get -o DPkg::Lock::Timeout=300 -y -q --no-install-recommends"
+# apt is chatty, so it gets its own log and the failure output shows the installer instead.
+# The package lists are refreshed once per run, only when something is about to be installed.
+APT_UPDATED=0
+apt_update() {
+    [ "$APT_UPDATED" = 1 ] && return 0
+    apt-get -o DPkg::Lock::Timeout=300 -q update >>"$APT_LOG" 2>&1
+    APT_UPDATED=1
+}
+
 # True when apt can actually install the package. apt-cache show also succeeds for virtual
 # names (on Ubuntu 24.04 libasound2 only points at libasound2t64), which apt then refuses.
 # (sh has no local variables, so the name must not clash with pkg_for_lib's)
@@ -1550,9 +1561,10 @@ installable() {
 }
 
 # Print the package that provides a shared library, guessed from its soname and confirmed
-# with apt: libpulse.so.0 -> libpulse0, libGL.so.1 -> libgl1, libglib-2.0.so.0 -> libglib2.0-0t64
+# with apt: libpulse.so.0 -> libpulse0, libGL.so.1 -> libgl1, libglib-2.0.so.0 -> libglib2.0-0t64,
+# libnetfilter_queue.so.1 -> libnetfilter-queue1 (package names cannot contain underscores)
 pkg_for_lib() {
-    name=$(echo "${1%%.so*}" | tr '[:upper:]' '[:lower:]')
+    name=$(echo "${1%%.so*}" | tr '[:upper:]_' '[:lower:]-')
     ver=""
     case "$1" in *.so.*) ver=${1##*.so.}; ver=${ver%%.*} ;; esac
     for base in "$name" "$(echo "$name" | sed 's/-\([0-9]\)/\1/')"; do
@@ -1597,20 +1609,18 @@ if [ ! -x "$JP_DIR/init-script" ] || [ "$(cat "$JP_DIR/.pra-jumpoint-id" 2>/dev/
     # The Jumpoint binary links against desktop libraries (audio, X, GL) that a server image
     # does not ship. Install the ones BeyondTrust recommends, plus libpulse, up front; names
     # this release does not know are skipped rather than failing the whole install.
-    export DEBIAN_FRONTEND=noninteractive
-    APT="apt-get -o DPkg::Lock::Timeout=300 -y -q --no-install-recommends"
-    # apt is chatty, so it gets its own log and the failure output shows the installer instead
-    apt-get -o DPkg::Lock::Timeout=300 -q update >>"$APT_LOG" 2>&1
+    apt_update
     BASE_PKGS=""
-    # The web engine (sra-web) also needs the GTK 3 and Chromium runtime stack. Both the
-    # older and the t64 package names are listed; apt-cache drops whichever does not exist.
+    # The web engine (sra-web) also needs the GTK 3 and Chromium runtime stack, and the
+    # protocol tunnel (sra-tnl) needs libnetfilter_queue. Both the older and the t64
+    # package names are listed; apt-cache drops whichever does not exist.
     for p in libpulse0 libglx0 libgl1 libegl1 libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 \
         libfreetype6 libx11-6 libx11-xcb1 libxcb1 libxext6 libxrender1 libdbus-1-3 \
         libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 libgtk-3-0 libgtk-3-0t64 \
         libatk1.0-0 libatk1.0-0t64 libatk-bridge2.0-0 libatk-bridge2.0-0t64 libglib2.0-0 \
         libglib2.0-0t64 libnss3 libnspr4 libasound2 libasound2t64 libcups2 libcups2t64 libgbm1 \
         libdrm2 libxshmfence1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libxi6 libxinerama1 \
-        libxrandr2 libxss1 libxtst6 libexpat1 fonts-liberation; do
+        libxrandr2 libxss1 libxtst6 libexpat1 fonts-liberation libnetfilter-queue1; do
         if installable "$p"; then BASE_PKGS="$BASE_PKGS $p"; fi
     done
     # One package apt will not take should not block the rest, so fall back to one at a time.
@@ -1659,6 +1669,45 @@ if [ ! -x "$JP_DIR/init-script" ] || [ "$(cat "$JP_DIR/.pra-jumpoint-id" 2>/dev/
     [ -x "$JP_DIR/init-script" ] || fail "no init-script in $JP_DIR after the install"
     echo "$JUMPOINT_ID" > "$JP_DIR/.pra-jumpoint-id"
     CHANGED=1
+fi
+
+# The installer only runs some of the Jumpoint's binaries. Others, such as the protocol tunnel
+# (sra-tnl), are first loaded when a session starts, so check every binary with ldd on every
+# run and install what they are missing. Libraries shipped inside $JP_DIR are left alone.
+missing_libs() {
+    find "$JP_DIR" -type f \( -perm -u+x -o -name '*.so*' \) 2>/dev/null | while read -r f; do
+        ldd "$f" 2>/dev/null | sed -n 's/^[[:space:]]*\([^[:space:]]*\) => not found.*/\1/p'
+    done | sort -u | while read -r lib; do
+        [ -n "$(find "$JP_DIR" -name "$lib" 2>/dev/null | head -n 1)" ] || echo "$lib"
+    done
+}
+# A new library can need another one, so repeat a few rounds while each one adds something
+ROUND=0
+MISSING=$(missing_libs)
+while [ -n "$MISSING" ] && [ "$ROUND" -lt 5 ]; do
+    ROUND=$((ROUND + 1))
+    echo "ldd round $ROUND, missing: $(echo "$MISSING" | tr '\n' ' ')" >>"$LOG"
+    ADDED=""
+    for lib in $MISSING; do
+        apt_update
+        if PKG=$(pkg_for_lib "$lib") && $APT install "$PKG" >>"$APT_LOG" 2>&1; then
+            echo "Installing $PKG for $lib" >>"$LOG"
+            ADDED="$ADDED $PKG"
+        else
+            echo "No package found or installed for $lib" >>"$LOG"
+        fi
+    done
+    [ -n "$ADDED" ] || break
+    case "$LIBS_NOTE" in
+        "") LIBS_NOTE="; also installed$ADDED" ;;
+        *) LIBS_NOTE="$LIBS_NOTE$ADDED" ;;
+    esac
+    CHANGED=1
+    MISSING=$(missing_libs)
+done
+# Not fatal, since a helper binary may never be used, but named so a failed session is easy to explain
+if [ -n "$MISSING" ]; then
+    LIBS_NOTE="$LIBS_NOTE; unresolved libraries: $(echo "$MISSING" | tr '\n' ' ')(see $LOG)"
 fi
 
 # The installer prints an example systemd unit (also kept in its POST-INSTALL-NOTES.txt).
