@@ -1531,13 +1531,23 @@ JP_USER=prajumpoint
 UNIT=/etc/systemd/system/pra-jumpoint.service
 mkdir -p /var/log/pra-demo
 LOG=/var/log/pra-demo/jumpoint.log
+APT_LOG=/var/log/pra-demo/jumpoint-apt.log
+# fail REASON [LOGFILE]: print the end of the log that explains it, then the marker
 fail() {
-    echo "--- end of $LOG ---"
-    tail -c 1500 "$LOG" 2>/dev/null
+    echo "--- end of ${2:-$LOG} ---"
+    tail -c 1500 "${2:-$LOG}" 2>/dev/null
     echo "JUMPOINT_FAILED:$1"
     exit 0
 }
 LIBS_NOTE=""
+
+# True when apt can actually install the package. apt-cache show also succeeds for virtual
+# names (on Ubuntu 24.04 libasound2 only points at libasound2t64), which apt then refuses.
+# (sh has no local variables, so the name must not clash with pkg_for_lib's)
+installable() {
+    apt_candidate=$(apt-cache policy "$1" 2>/dev/null | sed -n 's/^ *Candidate: *//p' | head -n 1)
+    [ -n "$apt_candidate" ] && [ "$apt_candidate" != "(none)" ]
+}
 
 # Print the package that provides a shared library, guessed from its soname and confirmed
 # with apt: libpulse.so.0 -> libpulse0, libGL.so.1 -> libgl1, libglib-2.0.so.0 -> libglib2.0-0t64
@@ -1547,7 +1557,7 @@ pkg_for_lib() {
     case "$1" in *.so.*) ver=${1##*.so.}; ver=${ver%%.*} ;; esac
     for base in "$name" "$(echo "$name" | sed 's/-\([0-9]\)/\1/')"; do
         for cand in "$base$ver" "$base-$ver" "${base}${ver}t64" "$base-${ver}t64"; do
-            if apt-cache show "$cand" >/dev/null 2>&1; then
+            if installable "$cand"; then
                 echo "$cand"
                 return 0
             fi
@@ -1585,7 +1595,6 @@ if [ ! -x "$JP_DIR/init-script" ] || [ "$(cat "$JP_DIR/.pra-jumpoint-id" 2>/dev/
     export DEBIAN_FRONTEND=noninteractive
     APT="apt-get -o DPkg::Lock::Timeout=300 -y -q --no-install-recommends"
     # apt is chatty, so it gets its own log and the failure output shows the installer instead
-    APT_LOG=/var/log/pra-demo/jumpoint-apt.log
     apt-get -o DPkg::Lock::Timeout=300 -q update >>"$APT_LOG" 2>&1
     BASE_PKGS=""
     # The web engine (sra-web) also needs the GTK 3 and Chromium runtime stack. Both the
@@ -1597,9 +1606,15 @@ if [ ! -x "$JP_DIR/init-script" ] || [ "$(cat "$JP_DIR/.pra-jumpoint-id" 2>/dev/
         libglib2.0-0t64 libnss3 libnspr4 libasound2 libasound2t64 libcups2 libcups2t64 libgbm1 \
         libdrm2 libxshmfence1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libxi6 libxinerama1 \
         libxrandr2 libxss1 libxtst6 libexpat1 fonts-liberation; do
-        if apt-cache show "$p" >/dev/null 2>&1; then BASE_PKGS="$BASE_PKGS $p"; fi
+        if installable "$p"; then BASE_PKGS="$BASE_PKGS $p"; fi
     done
-    $APT install $BASE_PKGS >>"$APT_LOG" 2>&1 || fail "could not install the Jumpoint's libraries (see $APT_LOG)"
+    # One package apt will not take should not block the rest, so fall back to one at a time.
+    # Anything still missing is reported by the installer and handled by the loop below.
+    if ! $APT install $BASE_PKGS >>"$APT_LOG" 2>&1; then
+        for p in $BASE_PKGS; do
+            $APT install "$p" >>"$APT_LOG" 2>&1 || echo "Could not install $p, continuing" >>"$LOG"
+        done
+    fi
 
     # The loader only names the first missing library, so install whatever the installer
     # reports and try again, a bounded number of times
@@ -1628,7 +1643,7 @@ if [ ! -x "$JP_DIR/init-script" ] || [ "$(cat "$JP_DIR/.pra-jumpoint-id" 2>/dev/
         [ "$TRIES" -lt 30 ] || fail "libraries still missing after $TRIES attempts (last: $LIB)"
         PKG=$(pkg_for_lib "$LIB") || fail "missing library $LIB, no package found for it"
         echo "Installing $PKG for $LIB" >>"$LOG"
-        $APT install "$PKG" >>"$APT_LOG" 2>&1 || fail "could not install $PKG for $LIB (see $APT_LOG)"
+        $APT install "$PKG" >>"$APT_LOG" 2>&1 || fail "could not install $PKG for $LIB" "$APT_LOG"
         EXTRA_PKGS="$EXTRA_PKGS $PKG"
         LAST_LIB="$LIB"
     done
