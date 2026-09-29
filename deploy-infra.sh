@@ -1537,6 +1537,24 @@ fail() {
     echo "JUMPOINT_FAILED:$1"
     exit 0
 }
+LIBS_NOTE=""
+
+# Print the package that provides a shared library, guessed from its soname and confirmed
+# with apt: libpulse.so.0 -> libpulse0, libGL.so.1 -> libgl1, libglib-2.0.so.0 -> libglib2.0-0t64
+pkg_for_lib() {
+    name=$(echo "${1%%.so*}" | tr '[:upper:]' '[:lower:]')
+    ver=""
+    case "$1" in *.so.*) ver=${1##*.so.}; ver=${ver%%.*} ;; esac
+    for base in "$name" "$(echo "$name" | sed 's/-\([0-9]\)/\1/')"; do
+        for cand in "$base$ver" "$base-$ver" "${base}${ver}t64" "$base-${ver}t64"; do
+            if apt-cache show "$cand" >/dev/null 2>&1; then
+                echo "$cand"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
 
 if ! id "$JP_USER" >/dev/null 2>&1; then
     useradd --system --home-dir "$JP_DIR" --shell /usr/sbin/nologin "$JP_USER" >>"$LOG" 2>&1 \
@@ -1551,9 +1569,6 @@ if [ ! -x "$JP_DIR/init-script" ] || [ "$(cat "$JP_DIR/.pra-jumpoint-id" 2>/dev/
         "$JP_DIR/init-script" stop >>"$LOG" 2>&1
         rm -rf "$JP_DIR"
     fi
-    mkdir -p "$JP_DIR" || fail "could not create $JP_DIR"
-    chown "$JP_USER" "$JP_DIR" || fail "could not give $JP_DIR to $JP_USER"
-
     WORK=$(mktemp -d)
     (cd "$WORK" && curl -fsS -J -O -H "Authorization: Bearer $BT_TOKEN" \
         "$BT_API_HOST/api/config/v1/jumpoint/$JUMPOINT_ID/installer") >>"$LOG" 2>&1 \
@@ -1562,11 +1577,54 @@ if [ ! -x "$JP_DIR/init-script" ] || [ "$(cat "$JP_DIR/.pra-jumpoint-id" 2>/dev/
     if [ $# -ne 1 ] || [ ! -f "$1" ] || [ "$(stat -c %s "$1")" -lt 1000000 ]; then
         fail "unexpected installer download: $*"
     fi
-    echo "Installing $(basename "$1")" >>"$LOG"
-    # No terminal to answer a prompt, so give up rather than hang until run-command times out
-    timeout 900 sh "$1" --install-dir "$JP_DIR" --user "$JP_USER" </dev/null >>"$LOG" 2>&1 \
-        || fail "installer exited with status $?"
+    INSTALLER="$1"
+
+    # The Jumpoint binary links against desktop libraries (audio, X, GL) that a server image
+    # does not ship. Install the ones BeyondTrust recommends, plus libpulse, up front; names
+    # this release does not know are skipped rather than failing the whole install.
+    export DEBIAN_FRONTEND=noninteractive
+    APT="apt-get -o DPkg::Lock::Timeout=300 -y -q --no-install-recommends"
+    apt-get -o DPkg::Lock::Timeout=300 -q update >>"$LOG" 2>&1
+    BASE_PKGS=""
+    for p in libpulse0 libglx0 libgl1 libegl1 libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 \
+        libfreetype6 libx11-6 libx11-xcb1 libxcb1 libxext6 libxrender1 libdbus-1-3; do
+        if apt-cache show "$p" >/dev/null 2>&1; then BASE_PKGS="$BASE_PKGS $p"; fi
+    done
+    $APT install $BASE_PKGS >>"$LOG" 2>&1 || fail "could not install the Jumpoint's libraries"
+
+    # The loader only names the first missing library, so install whatever the installer
+    # reports and try again, a bounded number of times
+    EXTRA_PKGS=""
+    LAST_LIB=""
+    TRIES=0
+    while :; do
+        TRIES=$((TRIES + 1))
+        # A failed attempt can leave files behind; start each one from an empty directory
+        rm -rf "$JP_DIR"
+        mkdir -p "$JP_DIR" || fail "could not create $JP_DIR"
+        chown "$JP_USER" "$JP_DIR" || fail "could not give $JP_DIR to $JP_USER"
+
+        echo "Installing $(basename "$INSTALLER") (attempt $TRIES)" >>"$LOG"
+        ATTEMPT=$(mktemp)
+        # No terminal to answer a prompt, so give up rather than hang until run-command times out
+        timeout 900 sh "$INSTALLER" --install-dir "$JP_DIR" --user "$JP_USER" </dev/null >"$ATTEMPT" 2>&1
+        RC=$?
+        cat "$ATTEMPT" >>"$LOG"
+        LIB=$(sed -n 's/.*error while loading shared libraries: \([^:]*\):.*/\1/p' "$ATTEMPT" | tail -n 1)
+        rm -f "$ATTEMPT"
+        [ "$RC" -eq 0 ] && break
+
+        [ -n "$LIB" ] || fail "installer exited with status $RC"
+        [ "$LIB" != "$LAST_LIB" ] || fail "missing library $LIB is still missing after installing its package"
+        [ "$TRIES" -lt 8 ] || fail "libraries still missing after $TRIES attempts (last: $LIB)"
+        PKG=$(pkg_for_lib "$LIB") || fail "missing library $LIB, no package found for it"
+        echo "Installing $PKG for $LIB" >>"$LOG"
+        $APT install "$PKG" >>"$LOG" 2>&1 || fail "could not install $PKG for $LIB"
+        EXTRA_PKGS="$EXTRA_PKGS $PKG"
+        LAST_LIB="$LIB"
+    done
     rm -rf "$WORK"
+    if [ -n "$EXTRA_PKGS" ]; then LIBS_NOTE="; also installed$EXTRA_PKGS"; fi
     [ -x "$JP_DIR/init-script" ] || fail "no init-script in $JP_DIR after the install"
     echo "$JUMPOINT_ID" > "$JP_DIR/.pra-jumpoint-id"
     CHANGED=1
@@ -1619,7 +1677,7 @@ if ! systemctl is-active --quiet pra-jumpoint.service; then
     fail "pra-jumpoint.service is not running"
 fi
 "$JP_DIR/init-script" status >>"$LOG" 2>&1 || fail "init-script status reports the Jumpoint is not running"
-echo "JUMPOINT_OK:running under systemd as pra-jumpoint.service (Type=$UNIT_TYPE)"
+echo "JUMPOINT_OK:running under systemd as pra-jumpoint.service (Type=$UNIT_TYPE)$LIBS_NOTE"
 exit 0
 REMOTE
 }
