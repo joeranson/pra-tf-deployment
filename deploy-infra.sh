@@ -1623,10 +1623,10 @@ if [ ! -x "$JP_DIR/init-script" ] || [ "$(cat "$JP_DIR/.pra-jumpoint-id" 2>/dev/
     TRIES=0
     while :; do
         TRIES=$((TRIES + 1))
-        # A failed attempt can leave files behind; start each one from an empty directory
+        # A failed attempt can leave files behind, and the installer refuses a directory that
+        # already exists, so remove it and let the installer create it for $JP_USER
         rm -rf "$JP_DIR"
-        mkdir -p "$JP_DIR" || fail "could not create $JP_DIR"
-        chown "$JP_USER" "$JP_DIR" || fail "could not give $JP_DIR to $JP_USER"
+        mkdir -p "$(dirname "$JP_DIR")" || fail "could not create $(dirname "$JP_DIR")"
 
         echo "Installing $(basename "$INSTALLER") (attempt $TRIES)" >>"$LOG"
         ATTEMPT=$(mktemp)
@@ -1648,6 +1648,8 @@ if [ ! -x "$JP_DIR/init-script" ] || [ "$(cat "$JP_DIR/.pra-jumpoint-id" 2>/dev/
         LAST_LIB="$LIB"
     done
     rm -rf "$WORK"
+    # The installer should hand the directory to --user; make sure, without failing on it
+    chown -R "$JP_USER" "$JP_DIR" >>"$LOG" 2>&1 || echo "Could not chown $JP_DIR to $JP_USER" >>"$LOG"
     if [ -n "$EXTRA_PKGS" ]; then LIBS_NOTE="; also installed$EXTRA_PKGS"; fi
     [ -x "$JP_DIR/init-script" ] || fail "no init-script in $JP_DIR after the install"
     echo "$JUMPOINT_ID" > "$JP_DIR/.pra-jumpoint-id"
