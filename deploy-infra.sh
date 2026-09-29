@@ -1532,10 +1532,10 @@ UNIT=/etc/systemd/system/pra-jumpoint.service
 mkdir -p /var/log/pra-demo
 LOG=/var/log/pra-demo/jumpoint.log
 APT_LOG=/var/log/pra-demo/jumpoint-apt.log
-# fail REASON [LOGFILE]: print the end of the log that explains it, then the marker
+# fail REASON [LOGFILE [BYTES]]: print the end of the log that explains it, then the marker
 fail() {
     echo "--- end of ${2:-$LOG} ---"
-    tail -c 1500 "${2:-$LOG}" 2>/dev/null
+    tail -c "${3:-1500}" "${2:-$LOG}" 2>/dev/null
     echo "JUMPOINT_FAILED:$1"
     exit 0
 }
@@ -1681,7 +1681,12 @@ UNIT_TYPE=$(sed -n 's/^[[:space:]]*Type=\([a-z]*\).*/\1/p' $HINT_FILES | tail -n
     echo "Type=$UNIT_TYPE"
     echo "ExecStart=$JP_DIR/init-script start"
     echo "ExecStop=$JP_DIR/init-script stop"
+    # init-script's su opens a login session, which moves the Jumpoint out of this unit's
+    # cgroup. Without RemainAfterExit systemd then sees an empty unit, decides it died and
+    # runs ExecStop, killing it. This is how systemd itself wraps classic init scripts.
+    echo "RemainAfterExit=yes"
     echo "GuessMainPID=no"
+    echo "KillMode=process"
     echo "TimeoutStartSec=120"
     echo ""
     echo "[Install]"
@@ -1695,22 +1700,50 @@ else
     CHANGED=1
 fi
 
+jumpoint_running() {
+    "$JP_DIR/init-script" status >/dev/null 2>&1 && pgrep -u "$JP_USER" >/dev/null 2>&1
+}
+
+# Everything that helps explain a Jumpoint that will not stay up, for the failure output
+jumpoint_diagnostics() {
+    DIAG=/var/log/pra-demo/jumpoint-diag.log
+    {
+        echo "--- end of $LOG ---"
+        tail -c 600 "$LOG" 2>/dev/null
+        echo "--- init-script status ---"
+        "$JP_DIR/init-script" status 2>&1 | tail -n 5
+        echo "--- processes of $JP_USER ---"
+        ps -u "$JP_USER" -o pid,cmd 2>&1 | head -n 6
+        echo "--- $JP_DIR/POST-INSTALL-NOTES.txt ---"
+        head -c 1200 "$JP_DIR/POST-INSTALL-NOTES.txt" 2>/dev/null
+    } > "$DIAG" 2>&1
+}
+
 # Anything the installer started runs outside systemd, so stop it and let the unit own it
 if ! systemctl is-active --quiet pra-jumpoint.service; then
     "$JP_DIR/init-script" stop >>"$LOG" 2>&1
 fi
 systemctl enable pra-jumpoint.service >>"$LOG" 2>&1 || fail "could not enable pra-jumpoint.service"
-if [ "$CHANGED" = 1 ]; then
+# With RemainAfterExit the unit can read "active" while the Jumpoint is gone, so restart
+# whenever it is not actually running, not only when something changed
+if [ "$CHANGED" = 1 ] || ! jumpoint_running; then
     systemctl restart pra-jumpoint.service >>"$LOG" 2>&1
 else
     systemctl start pra-jumpoint.service >>"$LOG" 2>&1
 fi
-sleep 5
-if ! systemctl is-active --quiet pra-jumpoint.service; then
-    systemctl status pra-jumpoint.service --no-pager >>"$LOG" 2>&1
-    fail "pra-jumpoint.service is not running"
-fi
-"$JP_DIR/init-script" status >>"$LOG" 2>&1 || fail "init-script status reports the Jumpoint is not running"
+
+# Judge by the Jumpoint itself: its own status check and a process running as its user
+i=0
+until jumpoint_running; do
+    i=$((i + 1))
+    if [ "$i" -gt 15 ]; then
+        systemctl status pra-jumpoint.service --no-pager >>"$LOG" 2>&1
+        jumpoint_diagnostics
+        fail "the Jumpoint is not running 30 seconds after starting pra-jumpoint.service" "$DIAG" 2800
+    fi
+    sleep 2
+done
+systemctl is-active --quiet pra-jumpoint.service || fail "pra-jumpoint.service is not active"
 echo "JUMPOINT_OK:running under systemd as pra-jumpoint.service (Type=$UNIT_TYPE)$LIBS_NOTE"
 exit 0
 REMOTE
