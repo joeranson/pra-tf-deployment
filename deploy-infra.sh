@@ -1566,10 +1566,15 @@ pkg_for_lib() {
     return 1
 }
 
+# init-script is run as root and switches to this user with su, which needs a real shell
+# (nologin makes su print "This account is currently not available" and start nothing).
+# The account stays locked, with no password or keys, so it still cannot be logged in to.
 if ! id "$JP_USER" >/dev/null 2>&1; then
-    useradd --system --home-dir "$JP_DIR" --shell /usr/sbin/nologin "$JP_USER" >>"$LOG" 2>&1 \
+    useradd --system --home-dir "$JP_DIR" --shell /bin/sh "$JP_USER" >>"$LOG" 2>&1 \
         || fail "could not create user $JP_USER"
 fi
+usermod --shell /bin/sh "$JP_USER" >>"$LOG" 2>&1 || fail "could not set the shell of $JP_USER"
+usermod --lock "$JP_USER" >>"$LOG" 2>&1 || fail "could not lock $JP_USER"
 
 # Install when missing, or reinstall when this VM holds a different Jumpoint (recreated in PRA)
 CHANGED=0
@@ -1656,11 +1661,15 @@ if [ ! -x "$JP_DIR/init-script" ] || [ "$(cat "$JP_DIR/.pra-jumpoint-id" 2>/dev/
     CHANGED=1
 fi
 
-# The installer prints an example systemd unit. Follow its Type= and User= when it has them,
-# otherwise wrap init-script the way systemd wraps a classic init script.
-grep -E '^[[:space:]]*(Type|User|ExecStart|PIDFile)=' "$LOG" | sort -u | head -n 8 | sed 's/^[[:space:]]*/JUMPOINT_UNIT_HINT:/'
-UNIT_TYPE=$(sed -n 's/^[[:space:]]*Type=\([a-z]*\).*/\1/p' "$LOG" | tail -n 1)
-UNIT_USER=$(sed -n 's/^[[:space:]]*User=\([A-Za-z0-9_.-]*\).*/\1/p' "$LOG" | tail -n 1)
+# The installer prints an example systemd unit (also kept in its POST-INSTALL-NOTES.txt).
+# Follow its Type= when it has one, otherwise wrap init-script the way systemd wraps a
+# classic init script. Its User= is deliberately ignored: init-script must run as root and
+# does its own su, which would ask for a password if run as the Jumpoint user.
+NOTES="$JP_DIR/POST-INSTALL-NOTES.txt"
+HINT_FILES="$LOG"
+if [ -f "$NOTES" ]; then HINT_FILES="$LOG $NOTES"; fi
+grep -hE '^[[:space:]]*(Type|User|ExecStart|PIDFile)=' $HINT_FILES | sort -u | head -n 8 | sed 's/^[[:space:]]*/JUMPOINT_UNIT_HINT:/'
+UNIT_TYPE=$(sed -n 's/^[[:space:]]*Type=\([a-z]*\).*/\1/p' $HINT_FILES | tail -n 1)
 [ -n "$UNIT_TYPE" ] || UNIT_TYPE=forking
 {
     echo "[Unit]"
@@ -1670,7 +1679,6 @@ UNIT_USER=$(sed -n 's/^[[:space:]]*User=\([A-Za-z0-9_.-]*\).*/\1/p' "$LOG" | tai
     echo ""
     echo "[Service]"
     echo "Type=$UNIT_TYPE"
-    if [ -n "$UNIT_USER" ]; then echo "User=$UNIT_USER"; fi
     echo "ExecStart=$JP_DIR/init-script start"
     echo "ExecStop=$JP_DIR/init-script stop"
     echo "GuessMainPID=no"
